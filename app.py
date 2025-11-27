@@ -1,38 +1,34 @@
 import requests
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import base64
+import psycopg
+from psycopg.rows import dict_row
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
-import base64
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
 
 # ============================================
-# Base64 Token 設定（安全版）
+# API TOKEN（自動 Base64 解碼）
 # ============================================
-TOKEN_BASE64 = "QmVhcmVyIGJzY1U0WUsyMitPWU9mU29oMTA1T3VWSkFoNHRzWVdaaEthd2k3V0tqWT0="
+ENCODED_TOKEN = os.getenv("THREADS_TOKEN_B64")
+API_TOKEN = base64.b64decode(ENCODED_TOKEN).decode().strip()
 
-def get_token():
-    """Base64 解碼，取得真正 Bearer Token"""
-    return base64.b64decode(TOKEN_BASE64.encode()).decode()
-
-# API Header 使用自動解碼的 Token
-HEADERS = {
-    "Authorization": get_token()
-}
-
-# ============================================
-# Threadslytics API
-# ============================================
 API_DOMAIN = "https://api.threadslytics.com/v1"
+HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # ============================================
-# PostgreSQL 連線
+# PostgreSQL 連線（psycopg3）
 # ============================================
-conn = psycopg2.connect(
-    "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz@sfo1.clusters.zeabur.com:30599/zeabur"
+conn = psycopg.connect(
+    os.getenv("DATABASE_URL"),
+    row_factory=dict_row
 )
-cursor = conn.cursor(cursor_factory=RealDictCursor)
+cursor = conn.cursor()
 
 # ============================================
 # 取得 keyword groups
@@ -43,7 +39,7 @@ def get_keyword_groups():
     return r.json()["data"]
 
 # ============================================
-# 抓某 group 所有貼文
+# 抓 group 底下所有貼文
 # ============================================
 def get_posts_by_group(group_id):
     posts = []
@@ -67,23 +63,22 @@ def get_posts_by_group(group_id):
     return posts
 
 # ============================================
-# 取得 metrics
+# 抓 metrics
 # ============================================
 def get_metrics(code):
-    r = requests.get(
-        f"{API_DOMAIN}/threads/post/metrics",
-        headers=HEADERS,
-        params={"code": code}
-    )
+    r = requests.get(f"{API_DOMAIN}/threads/post/metrics",
+                     headers=HEADERS,
+                     params={"code": code})
     r.raise_for_status()
     return r.json().get("data", [])
 
 # ============================================
-# 選 metrics 中「最有數據」的一筆
+# 最佳 metrics
 # ============================================
 def pick_best_metrics(metrics):
     if not metrics:
-        return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
+        return {"likeCount": 0, "directReplyCount": 0,
+                "shares": 0, "repostCount": 0}
 
     for m in metrics:
         if any([
@@ -97,22 +92,22 @@ def pick_best_metrics(metrics):
     return metrics[0]
 
 # ============================================
-# DB 查貼文是否存在
+# 查 DB 是否有這篇
 # ============================================
 def get_existing_post(permalink):
     cursor.execute(
-        "SELECT * FROM social_posts WHERE permalink = %s LIMIT 1",
+        "SELECT * FROM social_posts WHERE permalink=%s LIMIT 1",
         (permalink,)
     )
     return cursor.fetchone()
 
 # ============================================
-# Insert / Update
+# Insert or Update
 # ============================================
 def upsert_post(post, metrics):
-
     post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
     post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+
     now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
     existing = get_existing_post(post["permalink"])
@@ -135,7 +130,7 @@ def upsert_post(post, metrics):
             post["permalink"]
         ))
         conn.commit()
-        print(f"🔄 更新：{post['code']}（like={metrics['likeCount']}）")
+        print(f"🔄 更新：{post['code']} (like={metrics['likeCount']})")
 
     else:
         cursor.execute("""
@@ -163,46 +158,43 @@ def upsert_post(post, metrics):
             now_taipei
         ))
         conn.commit()
-        print(f"🆕 新增：{post['code']}（like={metrics['likeCount']}）")
+        print(f"🆕 新增：{post['code']} (like={metrics['likeCount']})")
 
 # ============================================
-# 每小時：抓 2–3 小時前貼文
+# 每小時抓 2–3 小時前貼文
 # ============================================
 def job_hourly():
-    print("\n⏰ [每小時] 抓取 2–3 小時前的新貼文")
+    print("\n⏰ 每小時任務執行")
 
-    now_utc = datetime.now(timezone.utc)
-    start_time = now_utc - timedelta(hours=3)
-    end_time = now_utc - timedelta(hours=2)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=3)
+    end = now - timedelta(hours=2)
 
     for group in get_keyword_groups():
         for p in get_posts_by_group(group["id"]):
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-
-            if start_time <= t <= end_time:
+            if start <= t <= end:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
 
 # ============================================
-# 每 12 小時：補抓 48 小時
+# 每 12 小時補抓 48 小時內貼文
 # ============================================
 def job_refresh():
-    print("\n🔁 [每 12 小時] 補抓 48 小時資料")
+    print("\n🔁 48 小時補抓任務執行")
 
-    now_utc = datetime.now(timezone.utc)
-    start_time = now_utc - timedelta(hours=48)
+    now = datetime.now(timezone.utc)
+    start = now - timedelta(hours=48)
 
     for group in get_keyword_groups():
         for p in get_posts_by_group(group["id"]):
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-
-            if t >= start_time:
+            if t >= start:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
 
-
 # ============================================
-# Flask + Scheduler
+# Flask + APScheduler
 # ============================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
@@ -213,7 +205,8 @@ scheduler.start()
 
 @app.route("/")
 def index():
-    return "Threads Crawler Running (Base64 Token Enabled)"
+    return "Threads Crawler is running (psycopg3)"
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
