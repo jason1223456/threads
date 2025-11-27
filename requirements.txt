@@ -1,0 +1,27 @@
+ Flask==2.0.3
+Flask-Cors==3.0.10
+Werkzeug==2.0.3
+
+# DB
+psycopg2-binary==2.9.9
+
+# HTTP 請求
+requests==2.31.0
+
+# 環境變數
+python-dotenv==1.0.1
+
+# Web Server
+gunicorn==20.1.0
+
+# Scheduler（你的專案需要，但你忘記放）
+APScheduler==3.10.4
+
+# PDF / OCR（你之前有放）
+pdf2image>=1.16
+pytesseract>=0.3
+Pillow>=9.0
+
+# Google AI（如果你真的有用）
+google-generativeai==0.8.5
+APScheduler==3.10.4
