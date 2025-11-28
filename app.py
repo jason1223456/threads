@@ -10,9 +10,9 @@ import os
 
 load_dotenv()
 
-# ============================================
+# =======================================================
 # API TOKEN（自動 Base64 解碼）
-# ============================================
+# =======================================================
 ENCODED_TOKEN = os.getenv("THREADS_TOKEN_B64")
 API_TOKEN = base64.b64decode(ENCODED_TOKEN).decode().strip()
 
@@ -21,26 +21,26 @@ HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
 TAIPEI_OFFSET = timedelta(hours=8)
 
-# ============================================
-# PostgreSQL 連線（psycopg3）
-# ============================================
+# =======================================================
+# PostgreSQL (psycopg3)
+# =======================================================
 conn = psycopg.connect(
     os.getenv("DATABASE_URL"),
     row_factory=dict_row
 )
 cursor = conn.cursor()
 
-# ============================================
+# =======================================================
 # 取得 keyword groups
-# ============================================
+# =======================================================
 def get_keyword_groups():
     r = requests.get(f"{API_DOMAIN}/keyword-groups", headers=HEADERS)
     r.raise_for_status()
     return r.json()["data"]
 
-# ============================================
+# =======================================================
 # 抓 group 底下所有貼文
-# ============================================
+# =======================================================
 def get_posts_by_group(group_id):
     posts = []
     page = 1
@@ -62,38 +62,50 @@ def get_posts_by_group(group_id):
 
     return posts
 
-# ============================================
+# =======================================================
 # 抓 metrics
-# ============================================
+# =======================================================
 def get_metrics(code):
-    r = requests.get(f"{API_DOMAIN}/threads/post/metrics",
-                     headers=HEADERS,
-                     params={"code": code})
+    r = requests.get(
+        f"{API_DOMAIN}/threads/post/metrics",
+        headers=HEADERS,
+        params={"code": code}
+    )
     r.raise_for_status()
     return r.json().get("data", [])
 
-# ============================================
-# 最佳 metrics
-# ============================================
+# =======================================================
+# 修正版：取最佳 metrics + 自動把 null 變 0
+# =======================================================
+def normalize_metrics(m):
+    return {
+        "likeCount": m.get("likeCount") or 0,
+        "directReplyCount": m.get("directReplyCount") or 0,
+        "shares": m.get("shares") or 0,
+        "repostCount": m.get("repostCount") or 0
+    }
+
 def pick_best_metrics(metrics):
     if not metrics:
-        return {"likeCount": 0, "directReplyCount": 0,
-                "shares": 0, "repostCount": 0}
+        return {
+            "likeCount": 0,
+            "directReplyCount": 0,
+            "shares": 0,
+            "repostCount": 0
+        }
 
+    # 找出任何有數據的那筆（避免全 0）
     for m in metrics:
-        if any([
-            m.get("likeCount", 0) > 0,
-            m.get("directReplyCount", 0) > 0,
-            m.get("shares", 0) > 0,
-            m.get("repostCount", 0) > 0
-        ]):
-            return m
+        nm = normalize_metrics(m)
+        if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
+            return nm
 
-    return metrics[0]
+    # 全 0 → return 第一筆 normalize
+    return normalize_metrics(metrics[0])
 
-# ============================================
-# 查 DB 是否有這篇
-# ============================================
+# =======================================================
+# 查 DB 是否已存在
+# =======================================================
 def get_existing_post(permalink):
     cursor.execute(
         "SELECT * FROM social_posts WHERE permalink=%s LIMIT 1",
@@ -101,9 +113,9 @@ def get_existing_post(permalink):
     )
     return cursor.fetchone()
 
-# ============================================
-# Insert or Update
-# ============================================
+# =======================================================
+# Insert/Update
+# =======================================================
 def upsert_post(post, metrics):
     post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
     post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
@@ -129,6 +141,7 @@ def upsert_post(post, metrics):
             now_taipei,
             post["permalink"]
         ))
+
         conn.commit()
         print(f"🔄 更新：{post['code']} (like={metrics['likeCount']})")
 
@@ -149,6 +162,7 @@ def upsert_post(post, metrics):
             post.get("caption"),
             post.get("permalink"),
             post.get("username"),
+
             metrics["likeCount"],
             metrics["directReplyCount"],
             metrics["shares"],
@@ -157,12 +171,13 @@ def upsert_post(post, metrics):
             now_taipei,
             now_taipei
         ))
+
         conn.commit()
         print(f"🆕 新增：{post['code']} (like={metrics['likeCount']})")
 
-# ============================================
+# =======================================================
 # 每小時抓 2–3 小時前貼文
-# ============================================
+# =======================================================
 def job_hourly():
     print("\n⏰ 每小時任務執行")
 
@@ -177,9 +192,9 @@ def job_hourly():
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
 
-# ============================================
+# =======================================================
 # 每 12 小時補抓 48 小時內貼文
-# ============================================
+# =======================================================
 def job_refresh():
     print("\n🔁 48 小時補抓任務執行")
 
@@ -193,9 +208,9 @@ def job_refresh():
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
 
-# ============================================
+# =======================================================
 # Flask + APScheduler
-# ============================================
+# =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
@@ -206,7 +221,6 @@ scheduler.start()
 @app.route("/")
 def index():
     return "Threads Crawler is running (psycopg3)"
-
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
