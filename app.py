@@ -1,5 +1,4 @@
 import requests
-import base64
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask
@@ -7,13 +6,9 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
 
 # =======================================================
-# API TOKEN（內嵌 Base64，不使用 .env）
+# API TOKEN（直接使用你原本有效的 Token，不用 Base64）
 # =======================================================
-# ⚠️ 你把真正 Token 做 Base64 後放到這裡即可
-THREADS_TOKEN_B64 = "YnNjVTRZS0IyMytPWW9mU29oMTA1T3VWSlpBaDR0c1lXWmhLYXdpN1dLejE9"
-
-# 解碼取得真正 Token
-API_TOKEN = base64.b64decode(THREADS_TOKEN_B64).decode().strip()
+API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -21,7 +16,7 @@ HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # =======================================================
-# PostgreSQL (psycopg3)
+# PostgreSQL 連線（你的資料庫）
 # =======================================================
 DATABASE_URL = "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz@sfo1.clusters.zeabur.com:30599/zeabur"
 
@@ -73,7 +68,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# 修正版：把 null 變 0
+# 修正版：把 null 變 0（防止 DB 變 NULL）
 # =======================================================
 def normalize_metrics(m):
     return {
