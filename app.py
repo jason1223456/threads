@@ -1,18 +1,19 @@
 import requests
+import base64
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
 
 # =======================================================
-# API TOKEN（直接從 .env 讀取，不使用 Base64）
+# API TOKEN（內嵌 Base64，不使用 .env）
 # =======================================================
-API_TOKEN = os.getenv("THREADS_TOKEN").strip()
+# ⚠️ 你把真正 Token 做 Base64 後放到這裡即可
+THREADS_TOKEN_B64 = "YnNjVTRZS0IyMytPWW9mU29oMTA1T3VWSlpBaDR0c1lXWmhLYXdpN1dLejE9"
+
+# 解碼取得真正 Token
+API_TOKEN = base64.b64decode(THREADS_TOKEN_B64).decode().strip()
 
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -22,10 +23,9 @@ TAIPEI_OFFSET = timedelta(hours=8)
 # =======================================================
 # PostgreSQL (psycopg3)
 # =======================================================
-conn = psycopg.connect(
-    os.getenv("DATABASE_URL"),
-    row_factory=dict_row
-)
+DATABASE_URL = "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz@sfo1.clusters.zeabur.com:30599/zeabur"
+
+conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 cursor = conn.cursor()
 
 # =======================================================
@@ -73,7 +73,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# 修正版：取最佳 metrics + 自動把 null 變 0
+# 修正版：把 null 變 0
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -92,7 +92,6 @@ def pick_best_metrics(metrics):
             "repostCount": 0
         }
 
-    # 找出任何有數據的那筆
     for m in metrics:
         nm = normalize_metrics(m)
         if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
@@ -111,7 +110,7 @@ def get_existing_post(permalink):
     return cursor.fetchone()
 
 # =======================================================
-# Insert/Update
+# Insert / Update
 # =======================================================
 def upsert_post(post, metrics):
     post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
