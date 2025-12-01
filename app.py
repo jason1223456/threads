@@ -1,5 +1,4 @@
 import requests
-import base64
 import psycopg
 from psycopg.rows import dict_row
 from flask import Flask
@@ -11,10 +10,9 @@ import os
 load_dotenv()
 
 # =======================================================
-# API TOKEN（自動 Base64 解碼）
+# API TOKEN（直接從 .env 讀取，不使用 Base64）
 # =======================================================
-ENCODED_TOKEN = os.getenv("THREADS_TOKEN_B64")
-API_TOKEN = base64.b64decode(ENCODED_TOKEN).decode().strip()
+API_TOKEN = os.getenv("THREADS_TOKEN").strip()
 
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
@@ -94,13 +92,12 @@ def pick_best_metrics(metrics):
             "repostCount": 0
         }
 
-    # 找出任何有數據的那筆（避免全 0）
+    # 找出任何有數據的那筆
     for m in metrics:
         nm = normalize_metrics(m)
         if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
             return nm
 
-    # 全 0 → return 第一筆 normalize
     return normalize_metrics(metrics[0])
 
 # =======================================================
