@@ -17,7 +17,12 @@ TAIPEI_OFFSET = timedelta(hours=8)
 # =======================================================
 # PostgreSQL
 # =======================================================
-DATABASE_URL = "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz@sfo1.clusters.zeabur.com:30599/zeabur"
+DATABASE_URL = (
+    "postgresql://root:"
+    "L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz"
+    "@sfo1.clusters.zeabur.com:30599/zeabur"
+)
+
 conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 cursor = conn.cursor()
 
@@ -81,12 +86,12 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — 專門寫入 social_posts_backup
+# DB FUNCTIONS — 寫入 social_posts
 # =======================================================
 def get_existing_post(permalink):
     try:
         cursor.execute(
-            "SELECT 1 FROM social_posts_backup WHERE permalink=%s LIMIT 1",
+            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1",
             (permalink,)
         )
         return cursor.fetchone()
@@ -96,7 +101,9 @@ def get_existing_post(permalink):
 
 def upsert_post(post, metrics):
     try:
-        post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
+        post_time_utc = datetime.fromisoformat(
+            post["postCreatedAt"].replace("Z", "+00:00")
+        )
         post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
         now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
@@ -104,7 +111,7 @@ def upsert_post(post, metrics):
 
         if existing:
             cursor.execute("""
-                UPDATE social_posts_backup
+                UPDATE social_posts
                 SET threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
@@ -123,15 +130,16 @@ def upsert_post(post, metrics):
 
         else:
             cursor.execute("""
-                INSERT INTO social_posts_backup (
+                INSERT INTO social_posts (
                     date, keyword, content, permalink, poster_name,
                     media_title, media_name, site, channel,
                     threads_like_count, threads_comment_count,
                     threads_share_count, threads_repost_count,
                     threads_topic, created_at, updated_at
                 )
-                VALUES (%s,%s,%s,%s,%s,'threads','threads','THREADS','threads專案',
-                    %s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s,%s,%s,%s,%s,
+                        'threads','threads','THREADS','threads專案',
+                        %s,%s,%s,%s,%s,%s,%s)
             """, (
                 post_time_taipei,
                 post.get("keywordText"),
@@ -151,15 +159,15 @@ def upsert_post(post, metrics):
         conn.commit()
 
     except Exception as e:
-        print("❌ 寫入錯誤 → rollback")
+        print("❌ 寫入錯誤 — rollback")
         print(e)
         conn.rollback()
 
 # =======================================================
-# 手動：只匯入 10 筆
+# 手動匯入 — 前 10 筆
 # =======================================================
 def manual_import_10():
-    print("\n===== 手動匯入 10 筆貼文 → social_posts_backup =====")
+    print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
 
     total = 0
 
@@ -175,16 +183,14 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# ⭐ 定時排程：
-#    每小時整點 → 抓前 3~2 小時的貼文
+# ⭐ 定時排程 — 每小時整點 → 抓前 3~2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
-    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts_backup")
+    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
-
-    start_time = now - timedelta(hours=3)  # 3 小時前
-    end_time = now - timedelta(hours=2)    # 2 小時前
+    start_time = now - timedelta(hours=3)
+    end_time = now - timedelta(hours=2)
 
     total = 0
 
@@ -207,16 +213,31 @@ def job_import_last_2_to_3_hours():
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)  # 每小時整點
+# 每小時排程
+scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
+
+# ⭐ 啟動後 5 秒自動匯入 10 筆（只會跑一次）
+scheduler.add_job(
+    manual_import_10,
+    "date",
+    run_date=datetime.utcnow() + timedelta(seconds=5)
+)
+
 scheduler.start()
 
+# ⭐ Health Check（一定要有）
+@app.route("/health")
+def health():
+    return "OK", 200
+
+# 根目錄
 @app.route("/")
 def index():
-    return "Threads Backup Crawler Running"
+    return "Threads SocialPosts Crawler Running"
 
 # =======================================================
-# MAIN
+# MAIN — 本地執行才會跑（Zeabur 不會執行此段）
 # =======================================================
 if __name__ == "__main__":
-    manual_import_10()  # 啟動程式時先匯入 10 筆
+    manual_import_10()
     app.run(host="0.0.0.0", port=5000)
