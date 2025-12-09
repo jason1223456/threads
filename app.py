@@ -86,7 +86,7 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — 寫入 social_posts
+# DB FUNCTIONS — channel 永遠寫 threads專案
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -110,7 +110,6 @@ def upsert_post(post, metrics):
         existing = get_existing_post(post["permalink"])
 
         if existing:
-            # ===== 修正：UPDATE 時強制更新 channel =====
             cursor.execute("""
                 UPDATE social_posts
                 SET threads_like_count=%s,
@@ -131,7 +130,6 @@ def upsert_post(post, metrics):
             print(f"🔄 更新：{post['code']}")
 
         else:
-            # ===== INSERT：新增資料 =====
             cursor.execute("""
                 INSERT INTO social_posts (
                     date, keyword, content, permalink, poster_name,
@@ -142,14 +140,13 @@ def upsert_post(post, metrics):
                 )
                 VALUES (%s,%s,%s,%s,%s,
                         'threads','threads','THREADS','threads專案',
-                        %s,%s,%s,%s,
-                        %s,%s,%s)
+                        %s,%s,%s,%s,%s,%s,%s)
             """, (
                 post_time_taipei,
                 post.get("keywordText"),
                 post.get("caption"),
                 post.get("permalink"),
-                post.get("username"),
+                post.get("username"),               # ← 正確 poster_name
                 metrics["likeCount"],
                 metrics["directReplyCount"],
                 metrics["shares"],
@@ -217,10 +214,8 @@ def job_import_last_2_to_3_hours():
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-# 每小時排程
 scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
 
-# 啟動後 5 秒自動匯入 10 筆（只跑一次）
 scheduler.add_job(
     manual_import_10,
     "date",
@@ -237,9 +232,6 @@ def health():
 def index():
     return "Threads SocialPosts Crawler Running"
 
-# =======================================================
-# MAIN — 本地執行才會跑
-# =======================================================
 if __name__ == "__main__":
     manual_import_10()
     app.run(host="0.0.0.0", port=5000)
