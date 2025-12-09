@@ -110,12 +110,14 @@ def upsert_post(post, metrics):
         existing = get_existing_post(post["permalink"])
 
         if existing:
+            # ===== 修正：UPDATE 時強制更新 channel =====
             cursor.execute("""
                 UPDATE social_posts
                 SET threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
                     threads_repost_count=%s,
+                    channel='threads專案',
                     updated_at=%s
                 WHERE permalink=%s
             """, (
@@ -129,6 +131,7 @@ def upsert_post(post, metrics):
             print(f"🔄 更新：{post['code']}")
 
         else:
+            # ===== INSERT：新增資料 =====
             cursor.execute("""
                 INSERT INTO social_posts (
                     date, keyword, content, permalink, poster_name,
@@ -139,7 +142,8 @@ def upsert_post(post, metrics):
                 )
                 VALUES (%s,%s,%s,%s,%s,
                         'threads','threads','THREADS','threads專案',
-                        %s,%s,%s,%s,%s,%s,%s)
+                        %s,%s,%s,%s,
+                        %s,%s,%s)
             """, (
                 post_time_taipei,
                 post.get("keywordText"),
@@ -216,7 +220,7 @@ scheduler = BackgroundScheduler()
 # 每小時排程
 scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
 
-# ⭐ 啟動後 5 秒自動匯入 10 筆（只會跑一次）
+# 啟動後 5 秒自動匯入 10 筆（只跑一次）
 scheduler.add_job(
     manual_import_10,
     "date",
@@ -225,18 +229,16 @@ scheduler.add_job(
 
 scheduler.start()
 
-# ⭐ Health Check（一定要有）
 @app.route("/health")
 def health():
     return "OK", 200
 
-# 根目錄
 @app.route("/")
 def index():
     return "Threads SocialPosts Crawler Running"
 
 # =======================================================
-# MAIN — 本地執行才會跑（Zeabur 不會執行此段）
+# MAIN — 本地執行才會跑
 # =======================================================
 if __name__ == "__main__":
     manual_import_10()
