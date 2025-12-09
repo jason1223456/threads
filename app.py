@@ -59,7 +59,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# METRICS
+# METRICS NORMALIZATION
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -81,7 +81,7 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — 只寫入 social_posts
+# DB FUNCTIONS — 寫入 social_posts
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -156,10 +156,10 @@ def upsert_post(post, metrics):
         conn.rollback()
 
 # =======================================================
-# 手動：匯入 10 筆
+# 手動匯入 — 前 10 筆
 # =======================================================
 def manual_import_10():
-    print("\n===== 手動匯入 10 筆貼文 → social_posts =====")
+    print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
 
     total = 0
 
@@ -175,13 +175,12 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# 每小時排程：抓「前 3 小時 → 前 2 小時」的貼文
+# ⭐ 定時排程 每小時整點 → 抓前 3~2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
-
     start_time = now - timedelta(hours=3)
     end_time = now - timedelta(hours=2)
 
@@ -201,13 +200,18 @@ def job_import_last_2_to_3_hours():
     print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
 
 # =======================================================
-# Flask + Scheduler
+# Flask + APScheduler
 # =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
 scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)  # 每小時整點
 scheduler.start()
+
+@app.before_first_request
+def run_manual_import():
+    print("⚡ Flask 啟動 → 自動匯入 10 筆")
+    manual_import_10()
 
 @app.route("/")
 def index():
@@ -217,5 +221,6 @@ def index():
 # MAIN
 # =======================================================
 if __name__ == "__main__":
-    manual_import_10()  # 啟動時先匯入 10 筆
+    # 本地啟動時也會跑 10 筆（Zeabur 不會跑這段）
+    manual_import_10()
     app.run(host="0.0.0.0", port=5000)
