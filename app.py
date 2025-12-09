@@ -59,7 +59,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# METRICS NORMALIZATION
+# METRICS
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -81,7 +81,7 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — 專門寫入 social_posts_backup
+# DB FUNCTIONS — 只寫入 social_posts
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -151,12 +151,12 @@ def upsert_post(post, metrics):
         conn.commit()
 
     except Exception as e:
-        print("❌ 寫入錯誤 → rollback")
+        print("❌ 寫入錯誤 — rollback")
         print(e)
         conn.rollback()
 
 # =======================================================
-# 手動：只匯入 10 筆
+# 手動：匯入 10 筆
 # =======================================================
 def manual_import_10():
     print("\n===== 手動匯入 10 筆貼文 → social_posts =====")
@@ -175,16 +175,15 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# ⭐ 定時排程：
-#    每小時整點 → 抓前 3~2 小時的貼文
+# 每小時排程：抓「前 3 小時 → 前 2 小時」的貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
 
-    start_time = now - timedelta(hours=3)  # 3 小時前
-    end_time = now - timedelta(hours=2)    # 2 小時前
+    start_time = now - timedelta(hours=3)
+    end_time = now - timedelta(hours=2)
 
     total = 0
 
@@ -202,7 +201,7 @@ def job_import_last_2_to_3_hours():
     print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
 
 # =======================================================
-# Flask + APScheduler
+# Flask + Scheduler
 # =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
@@ -212,11 +211,11 @@ scheduler.start()
 
 @app.route("/")
 def index():
-    return "Threads Backup Crawler Running"
+    return "Threads SocialPosts Crawler Running"
 
 # =======================================================
 # MAIN
 # =======================================================
 if __name__ == "__main__":
-    manual_import_10()  # 啟動程式時先匯入 10 筆
+    manual_import_10()  # 啟動時先匯入 10 筆
     app.run(host="0.0.0.0", port=5000)
