@@ -81,12 +81,12 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — 寫入 social_posts
+# DB FUNCTIONS — 專門寫入 social_posts_backup
 # =======================================================
 def get_existing_post(permalink):
     try:
         cursor.execute(
-            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1",
+            "SELECT 1 FROM social_posts_backup WHERE permalink=%s LIMIT 1",
             (permalink,)
         )
         return cursor.fetchone()
@@ -104,7 +104,7 @@ def upsert_post(post, metrics):
 
         if existing:
             cursor.execute("""
-                UPDATE social_posts
+                UPDATE social_posts_backup
                 SET threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
@@ -123,7 +123,7 @@ def upsert_post(post, metrics):
 
         else:
             cursor.execute("""
-                INSERT INTO social_posts (
+                INSERT INTO social_posts_backup (
                     date, keyword, content, permalink, poster_name,
                     media_title, media_name, site, channel,
                     threads_like_count, threads_comment_count,
@@ -151,15 +151,15 @@ def upsert_post(post, metrics):
         conn.commit()
 
     except Exception as e:
-        print("❌ 寫入錯誤 — rollback")
+        print("❌ 寫入錯誤 → rollback")
         print(e)
         conn.rollback()
 
 # =======================================================
-# 手動匯入 — 前 10 筆
+# 手動：只匯入 10 筆
 # =======================================================
 def manual_import_10():
-    print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
+    print("\n===== 手動匯入 10 筆貼文 → social_posts_backup =====")
 
     total = 0
 
@@ -175,14 +175,16 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# ⭐ 定時排程 每小時整點 → 抓前 3~2 小時貼文
+# ⭐ 定時排程：
+#    每小時整點 → 抓前 3~2 小時的貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
-    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
+    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts_backup")
 
     now = datetime.now(timezone.utc)
-    start_time = now - timedelta(hours=3)
-    end_time = now - timedelta(hours=2)
+
+    start_time = now - timedelta(hours=3)  # 3 小時前
+    end_time = now - timedelta(hours=2)    # 2 小時前
 
     total = 0
 
@@ -205,21 +207,16 @@ def job_import_last_2_to_3_hours():
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-# ⭐ 每小時整點
-scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
-
-# ⭐ Zeabur/Gunicorn 啟動 5 秒後自動匯入 10 筆（只會跑一次）
-scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
-
+scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)  # 每小時整點
 scheduler.start()
 
 @app.route("/")
 def index():
-    return "Threads SocialPosts Crawler Running"
+    return "Threads Backup Crawler Running"
 
 # =======================================================
-# MAIN — 本地才會跑（Zeabur 不會用到）
+# MAIN
 # =======================================================
 if __name__ == "__main__":
-    manual_import_10()
+    manual_import_10()  # 啟動程式時先匯入 10 筆
     app.run(host="0.0.0.0", port=5000)
