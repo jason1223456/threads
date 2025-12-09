@@ -6,34 +6,29 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
 
 # =======================================================
-# API TOKEN（直接使用你原本有效的 Token，不用 Base64）
+# API TOKEN
 # =======================================================
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
-
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # =======================================================
-# PostgreSQL 連線（你的資料庫）
+# PostgreSQL
 # =======================================================
 DATABASE_URL = "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz@sfo1.clusters.zeabur.com:30599/zeabur"
-
 conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 cursor = conn.cursor()
 
 # =======================================================
-# 取得 keyword groups
+# API FUNCTIONS
 # =======================================================
 def get_keyword_groups():
     r = requests.get(f"{API_DOMAIN}/keyword-groups", headers=HEADERS)
     r.raise_for_status()
     return r.json()["data"]
 
-# =======================================================
-# 抓 group 底下所有貼文
-# =======================================================
 def get_posts_by_group(group_id):
     posts = []
     page = 1
@@ -46,7 +41,6 @@ def get_posts_by_group(group_id):
         )
         r.raise_for_status()
         chunk = r.json().get("posts", [])
-
         if not chunk:
             break
 
@@ -55,9 +49,6 @@ def get_posts_by_group(group_id):
 
     return posts
 
-# =======================================================
-# 抓 metrics
-# =======================================================
 def get_metrics(code):
     r = requests.get(
         f"{API_DOMAIN}/threads/post/metrics",
@@ -68,7 +59,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# 修正版：把 null 變 0（防止 DB 變 NULL）
+# METRICS NORMALIZATION
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -80,12 +71,7 @@ def normalize_metrics(m):
 
 def pick_best_metrics(metrics):
     if not metrics:
-        return {
-            "likeCount": 0,
-            "directReplyCount": 0,
-            "shares": 0,
-            "repostCount": 0
-        }
+        return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
 
     for m in metrics:
         nm = normalize_metrics(m)
@@ -95,29 +81,25 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# 查 DB 是否已存在
+# DB FUNCTIONS (WRITE TO social_posts_backup)
 # =======================================================
 def get_existing_post(permalink):
     cursor.execute(
-        "SELECT * FROM social_posts WHERE permalink=%s LIMIT 1",
+        "SELECT * FROM social_posts_backup WHERE permalink=%s LIMIT 1",
         (permalink,)
     )
     return cursor.fetchone()
 
-# =======================================================
-# Insert / Update
-# =======================================================
 def upsert_post(post, metrics):
     post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
     post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-
     now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
     existing = get_existing_post(post["permalink"])
 
     if existing:
         cursor.execute("""
-            UPDATE social_posts
+            UPDATE social_posts_backup
             SET threads_like_count=%s,
                 threads_comment_count=%s,
                 threads_share_count=%s,
@@ -132,13 +114,12 @@ def upsert_post(post, metrics):
             now_taipei,
             post["permalink"]
         ))
-
         conn.commit()
-        print(f"🔄 更新：{post['code']} (like={metrics['likeCount']})")
+        print(f"🔄 更新（BACKUP）：{post['code']}")
 
     else:
         cursor.execute("""
-            INSERT INTO social_posts (
+            INSERT INTO social_posts_backup (
                 date, keyword, content, permalink, poster_name,
                 media_title, media_name, site, channel,
                 threads_like_count, threads_comment_count,
@@ -153,7 +134,6 @@ def upsert_post(post, metrics):
             post.get("caption"),
             post.get("permalink"),
             post.get("username"),
-
             metrics["likeCount"],
             metrics["directReplyCount"],
             metrics["shares"],
@@ -164,33 +144,34 @@ def upsert_post(post, metrics):
         ))
 
         conn.commit()
-        print(f"🆕 新增：{post['code']} (like={metrics['likeCount']})")
+        print(f"🆕 新增（BACKUP）：{post['code']}")
 
 # =======================================================
-# 每小時抓 2–3 小時前貼文
+# 手動補抓：抓所有貼文 → backup
 # =======================================================
-def job_hourly():
-    print("\n⏰ 每小時任務執行")
+def manual_import_all():
+    print("\n===== 手動補抓所有貼文 → social_posts_backup =====")
 
-    now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=3)
-    end = now - timedelta(hours=2)
-
+    total = 0
     for group in get_keyword_groups():
-        for p in get_posts_by_group(group["id"]):
-            t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-            if start <= t <= end:
-                metrics = pick_best_metrics(get_metrics(p["code"]))
-                upsert_post(p, metrics)
+        print(f"\n🔍 群組：{group['groupName']}")
+        posts = get_posts_by_group(group["id"])
+
+        for p in posts:
+            metrics = pick_best_metrics(get_metrics(p["code"]))
+            upsert_post(p, metrics)
+            total += 1
+
+    print(f"\n🎉 完成！共寫入/更新 {total} 筆到 social_posts_backup")
 
 # =======================================================
-# 每 12 小時補抓 48 小時內貼文
+# 定時任務：每小時寫入最近兩小時貼文
 # =======================================================
-def job_refresh():
-    print("\n🔁 48 小時補抓任務執行")
+def job_last_2_hours():
+    print("\n⏰ 每小時更新最近兩小時貼文 → social_posts_backup")
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=48)
+    start = now - timedelta(hours=2)
 
     for group in get_keyword_groups():
         for p in get_posts_by_group(group["id"]):
@@ -200,18 +181,21 @@ def job_refresh():
                 upsert_post(p, metrics)
 
 # =======================================================
-# Flask + APScheduler
+# Flask + Scheduler
 # =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-scheduler.add_job(job_hourly, "cron", minute=0)
-scheduler.add_job(job_refresh, "cron", hour="0,12")
+scheduler.add_job(job_last_2_hours, "cron", minute=0)
 scheduler.start()
 
 @app.route("/")
 def index():
-    return "Threads Crawler is running (psycopg3)"
+    return "Threads BACKUP crawler is running"
 
+# =======================================================
+# MAIN
+# =======================================================
 if __name__ == "__main__":
+    manual_import_all()  # ← 手動匯入全部
     app.run(host="0.0.0.0", port=5000)
