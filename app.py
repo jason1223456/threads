@@ -81,121 +81,142 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS (WRITE TO social_posts_backup)
+# DB FUNCTIONS — 專門寫入 social_posts_backup
 # =======================================================
 def get_existing_post(permalink):
-    cursor.execute(
-        "SELECT * FROM social_posts_backup WHERE permalink=%s LIMIT 1",
-        (permalink,)
-    )
-    return cursor.fetchone()
+    try:
+        cursor.execute(
+            "SELECT 1 FROM social_posts_backup WHERE permalink=%s LIMIT 1",
+            (permalink,)
+        )
+        return cursor.fetchone()
+    except Exception:
+        conn.rollback()
+        return None
 
 def upsert_post(post, metrics):
-    post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
-    post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-    now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
+    try:
+        post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
+        post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+        now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
-    existing = get_existing_post(post["permalink"])
+        existing = get_existing_post(post["permalink"])
 
-    if existing:
-        cursor.execute("""
-            UPDATE social_posts_backup
-            SET threads_like_count=%s,
-                threads_comment_count=%s,
-                threads_share_count=%s,
-                threads_repost_count=%s,
-                updated_at=%s
-            WHERE permalink=%s
-        """, (
-            metrics["likeCount"],
-            metrics["directReplyCount"],
-            metrics["shares"],
-            metrics["repostCount"],
-            now_taipei,
-            post["permalink"]
-        ))
+        if existing:
+            cursor.execute("""
+                UPDATE social_posts_backup
+                SET threads_like_count=%s,
+                    threads_comment_count=%s,
+                    threads_share_count=%s,
+                    threads_repost_count=%s,
+                    updated_at=%s
+                WHERE permalink=%s
+            """, (
+                metrics["likeCount"],
+                metrics["directReplyCount"],
+                metrics["shares"],
+                metrics["repostCount"],
+                now_taipei,
+                post["permalink"]
+            ))
+            print(f"🔄 更新：{post['code']}")
+
+        else:
+            cursor.execute("""
+                INSERT INTO social_posts_backup (
+                    date, keyword, content, permalink, poster_name,
+                    media_title, media_name, site, channel,
+                    threads_like_count, threads_comment_count,
+                    threads_share_count, threads_repost_count,
+                    threads_topic, created_at, updated_at
+                )
+                VALUES (%s,%s,%s,%s,%s,'threads','threads','THREADS','threads專案',
+                    %s,%s,%s,%s,%s,%s,%s)
+            """, (
+                post_time_taipei,
+                post.get("keywordText"),
+                post.get("caption"),
+                post.get("permalink"),
+                post.get("username"),
+                metrics["likeCount"],
+                metrics["directReplyCount"],
+                metrics["shares"],
+                metrics["repostCount"],
+                post.get("tagHeader"),
+                now_taipei,
+                now_taipei
+            ))
+            print(f"🆕 新增：{post['code']}")
+
         conn.commit()
-        print(f"🔄 更新（BACKUP）：{post['code']}")
 
-    else:
-        cursor.execute("""
-            INSERT INTO social_posts_backup (
-                date, keyword, content, permalink, poster_name,
-                media_title, media_name, site, channel,
-                threads_like_count, threads_comment_count,
-                threads_share_count, threads_repost_count,
-                threads_topic, created_at, updated_at
-            )
-            VALUES (%s,%s,%s,%s,%s,'threads','threads','THREADS','threads專案',
-                %s,%s,%s,%s,%s,%s,%s)
-        """, (
-            post_time_taipei,
-            post.get("keywordText"),
-            post.get("caption"),
-            post.get("permalink"),
-            post.get("username"),
-            metrics["likeCount"],
-            metrics["directReplyCount"],
-            metrics["shares"],
-            metrics["repostCount"],
-            post.get("tagHeader"),
-            now_taipei,
-            now_taipei
-        ))
-
-        conn.commit()
-        print(f"🆕 新增（BACKUP）：{post['code']}")
+    except Exception as e:
+        print("❌ 寫入錯誤 → rollback")
+        print(e)
+        conn.rollback()
 
 # =======================================================
-# 手動補抓：抓所有貼文 → backup
+# 手動：只匯入 10 筆
 # =======================================================
-def manual_import_all():
-    print("\n===== 手動補抓所有貼文 → social_posts_backup =====")
+def manual_import_10():
+    print("\n===== 手動匯入 10 筆貼文 → social_posts_backup =====")
 
     total = 0
-    for group in get_keyword_groups():
-        print(f"\n🔍 群組：{group['groupName']}")
-        posts = get_posts_by_group(group["id"])
 
+    for group in get_keyword_groups():
+        posts = get_posts_by_group(group["id"])
         for p in posts:
+            if total >= 10:
+                print("\n🎉 已完成匯入 10 筆")
+                return
             metrics = pick_best_metrics(get_metrics(p["code"]))
             upsert_post(p, metrics)
             total += 1
-
-    print(f"\n🎉 完成！共寫入/更新 {total} 筆到 social_posts_backup")
+            print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# 定時任務：每小時寫入最近兩小時貼文
+# ⭐ 定時排程：
+#    每小時整點 → 抓前 3~2 小時的貼文
 # =======================================================
-def job_last_2_hours():
-    print("\n⏰ 每小時更新最近兩小時貼文 → social_posts_backup")
+def job_import_last_2_to_3_hours():
+    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts_backup")
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=2)
+
+    start_time = now - timedelta(hours=3)  # 3 小時前
+    end_time = now - timedelta(hours=2)    # 2 小時前
+
+    total = 0
 
     for group in get_keyword_groups():
-        for p in get_posts_by_group(group["id"]):
+        posts = get_posts_by_group(group["id"])
+
+        for p in posts:
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-            if t >= start:
+
+            if start_time <= t <= end_time:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
+                total += 1
+
+    print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
 
 # =======================================================
-# Flask + Scheduler
+# Flask + APScheduler
 # =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-scheduler.add_job(job_last_2_hours, "cron", minute=0)
+scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)  # 每小時整點
 scheduler.start()
 
 @app.route("/")
 def index():
-    return "Threads BACKUP crawler is running"
+    return "Threads Backup Crawler Running"
 
 # =======================================================
 # MAIN
 # =======================================================
 if __name__ == "__main__":
-    manual_import_all()  # ← 手動匯入全部
+    manual_import_10()  # 啟動程式時先匯入 10 筆
     app.run(host="0.0.0.0", port=5000)
