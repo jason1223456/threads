@@ -86,7 +86,7 @@ def pick_best_metrics(metrics):
 def get_existing_post(permalink):
     try:
         cursor.execute(
-            "SELECT 1 FROM social_posts_backup WHERE permalink=%s LIMIT 1",
+            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1",
             (permalink,)
         )
         return cursor.fetchone()
@@ -104,7 +104,7 @@ def upsert_post(post, metrics):
 
         if existing:
             cursor.execute("""
-                UPDATE social_posts_backup
+                UPDATE social_posts
                 SET threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
@@ -123,7 +123,7 @@ def upsert_post(post, metrics):
 
         else:
             cursor.execute("""
-                INSERT INTO social_posts_backup (
+                INSERT INTO social_posts (
                     date, keyword, content, permalink, poster_name,
                     media_title, media_name, site, channel,
                     threads_like_count, threads_comment_count,
@@ -159,7 +159,7 @@ def upsert_post(post, metrics):
 # 手動：只匯入 10 筆
 # =======================================================
 def manual_import_10():
-    print("\n===== 手動匯入 10 筆貼文 → social_posts_backup =====")
+    print("\n===== 手動匯入 10 筆貼文 → social_posts =====")
 
     total = 0
 
@@ -179,7 +179,7 @@ def manual_import_10():
 #    每小時整點 → 抓前 3~2 小時的貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
-    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts_backup")
+    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
 
