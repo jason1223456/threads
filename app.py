@@ -205,22 +205,21 @@ def job_import_last_2_to_3_hours():
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
-scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)  # 每小時整點
-scheduler.start()
+# ⭐ 每小時整點
+scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
 
-@app.before_first_request
-def run_manual_import():
-    print("⚡ Flask 啟動 → 自動匯入 10 筆")
-    manual_import_10()
+# ⭐ Zeabur/Gunicorn 啟動 5 秒後自動匯入 10 筆（只會跑一次）
+scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
+
+scheduler.start()
 
 @app.route("/")
 def index():
     return "Threads SocialPosts Crawler Running"
 
 # =======================================================
-# MAIN
+# MAIN — 本地才會跑（Zeabur 不會用到）
 # =======================================================
 if __name__ == "__main__":
-    # 本地啟動時也會跑 10 筆（Zeabur 不會跑這段）
     manual_import_10()
     app.run(host="0.0.0.0", port=5000)
