@@ -4,6 +4,33 @@ from psycopg.rows import dict_row
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
+import smtplib
+from email.mime.text import MIMEText
+from email.header import Header
+
+# =======================================================
+# Gmail SMTP 設定（你要修改這裡）
+# =======================================================
+SMTP_USER = "jason91082500@gmail.com"   # 例如：myaccount@gmail.com
+SMTP_PASS = "rwun dvta ybzr gzlz"         # ← Gmail App Password
+TO_EMAIL = "leona@brainmax-marketing.com"
+
+def send_mail(subject, body):
+    """寄信給 Leona"""
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = SMTP_USER
+        msg["To"] = TO_EMAIL
+
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
+            server.login(SMTP_USER, SMTP_PASS)
+            server.sendmail(SMTP_USER, [TO_EMAIL], msg.as_string())
+
+        print("📧 已寄信給 Leona")
+    except Exception as e:
+        print("❌ 寄信失敗：", e)
 
 # =======================================================
 # API TOKEN
@@ -80,14 +107,11 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS (channel 永遠 threads專案 + api_source threadslytics)
+# DB FUNCTIONS
 # =======================================================
 def get_existing_post(permalink):
     try:
-        cursor.execute(
-            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", 
-            (permalink,)
-        )
+        cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
         return cursor.fetchone()
     except Exception:
         conn.rollback()
@@ -172,6 +196,12 @@ def upsert_post(post, metrics):
                 now_taipei
             ))
             print(f"🆕 新增：{post['code']}")
+
+            # ⭐⭐⭐ 新增時寄信
+            send_mail(
+                subject="Threads 新增貼文通知",
+                body=f"新增貼文：{post['permalink']}\n使用者：{post.get('username')}"
+            )
 
         conn.commit()
 
