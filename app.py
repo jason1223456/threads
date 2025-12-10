@@ -48,7 +48,6 @@ def get_posts_by_group(group_id):
         chunk = r.json().get("posts", [])
         if not chunk:
             break
-
         posts.extend(chunk)
         page += 1
 
@@ -62,7 +61,6 @@ def get_metrics(code):
     )
     r.raise_for_status()
     return r.json().get("data", [])
-
 
 # =======================================================
 # METRICS NORMALIZATION
@@ -78,17 +76,14 @@ def normalize_metrics(m):
 def pick_best_metrics(metrics):
     if not metrics:
         return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
-
     for m in metrics:
         nm = normalize_metrics(m)
         if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
             return nm
-
     return normalize_metrics(metrics[0])
 
-
 # =======================================================
-# DB FUNCTIONS — channel 永遠 threads專案
+# DB FUNCTIONS — channel 永遠寫 threads專案
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -101,12 +96,10 @@ def get_existing_post(permalink):
         conn.rollback()
         return None
 
-
 def upsert_post(post, metrics):
     try:
         post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-
         now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
         existing = get_existing_post(post["permalink"])
@@ -140,24 +133,19 @@ def upsert_post(post, metrics):
                     threads_share_count, threads_repost_count,
                     threads_topic, created_at, updated_at
                 )
-                VALUES (
-                    %s, %s, %s, %s, %s,
-                    'threads', 'threads', 'THREADS', 'threads專案',
-                    %s, %s, %s, %s,
-                    %s, %s, %s
-                )
+                VALUES (%s,%s,%s,%s,%s,
+                        'threads','threads','THREADS','threads專案',
+                        %s,%s,%s,%s,%s,%s,%s)
             """, (
                 post_time_taipei,
                 post.get("keywordText"),
                 post.get("caption"),
                 post.get("permalink"),
-                post.get("username"),
-
+                post.get("username"),   # ← 正確：避免覆蓋成 threads專案
                 metrics["likeCount"],
                 metrics["directReplyCount"],
                 metrics["shares"],
                 metrics["repostCount"],
-
                 post.get("tagHeader"),
                 now_taipei,
                 now_taipei
@@ -171,9 +159,8 @@ def upsert_post(post, metrics):
         print(e)
         conn.rollback()
 
-
 # =======================================================
-# 手動匯入 — 10 筆
+# 手動匯入 — 前 10 筆
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
@@ -181,42 +168,37 @@ def manual_import_10():
 
     for group in get_keyword_groups():
         posts = get_posts_by_group(group["id"])
-
         for p in posts:
             if total >= 10:
                 print("\n🎉 已完成匯入 10 筆")
                 return
-
             metrics = pick_best_metrics(get_metrics(p["code"]))
             upsert_post(p, metrics)
             total += 1
             print(f"🆕 第 {total} 筆：{p['code']}")
 
-
 # =======================================================
-# ⭐ 定時排程：每小時抓 3~2 小時貼文
+# ⭐ 定時排程 — 每小時整點 → 抓前 3~2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=3)
-    end = now - timedelta(hours=2)
+    start_time = now - timedelta(hours=3)
+    end_time = now - timedelta(hours=2)
 
     total = 0
 
     for group in get_keyword_groups():
         posts = get_posts_by_group(group["id"])
-
         for p in posts:
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-            if start <= t <= end:
+            if start_time <= t <= end_time:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
                 upsert_post(p, metrics)
                 total += 1
 
-    print(f"✨ 本次排程匯入 {total} 筆（{start} ～ {end}）")
-
+    print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
 
 # =======================================================
 # Flask + APScheduler
@@ -225,30 +207,18 @@ app = Flask(__name__)
 scheduler = BackgroundScheduler()
 
 scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
-
-# 啟動後自動匯入 10 筆（預防空白）
-scheduler.add_job(
-    manual_import_10,
-    "date",
-    run_date=datetime.utcnow() + timedelta(seconds=5)
-)
+scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
 
 scheduler.start()
-
 
 @app.route("/health")
 def health():
     return "OK", 200
 
-
 @app.route("/")
 def index():
     return "Threads SocialPosts Crawler Running"
 
-
-# =======================================================
-# 本地執行
-# =======================================================
 if __name__ == "__main__":
     manual_import_10()
     app.run(host="0.0.0.0", port=5000)
