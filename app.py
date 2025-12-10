@@ -48,6 +48,7 @@ def get_posts_by_group(group_id):
         chunk = r.json().get("posts", [])
         if not chunk:
             break
+
         posts.extend(chunk)
         page += 1
 
@@ -76,21 +77,20 @@ def normalize_metrics(m):
 def pick_best_metrics(metrics):
     if not metrics:
         return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
+
     for m in metrics:
         nm = normalize_metrics(m)
         if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
             return nm
+
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS — channel 永遠寫 threads專案
+# DB FUNCTIONS (channel 永遠是 threads專案)
 # =======================================================
 def get_existing_post(permalink):
     try:
-        cursor.execute(
-            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1",
-            (permalink,)
-        )
+        cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
         return cursor.fetchone()
     except Exception:
         conn.rollback()
@@ -104,26 +104,44 @@ def upsert_post(post, metrics):
 
         existing = get_existing_post(post["permalink"])
 
+        # =======================================================
+        # UPDATE — 修正 channel 永遠為 threads專案
+        # =======================================================
         if existing:
             cursor.execute("""
                 UPDATE social_posts
-                SET threads_like_count=%s,
+                SET 
+                    keyword=%s,
+                    content=%s,
+                    poster_name=%s,
+                    media_title='threads',
+                    media_name='threads',
+                    site='THREADS',
+                    channel='threads專案',
+                    threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
                     threads_repost_count=%s,
-                    channel='threads專案',
+                    threads_topic=%s,
                     updated_at=%s
                 WHERE permalink=%s
             """, (
+                post.get("keywordText"),
+                post.get("caption"),
+                post.get("username"),
                 metrics["likeCount"],
                 metrics["directReplyCount"],
                 metrics["shares"],
                 metrics["repostCount"],
+                post.get("tagHeader"),
                 now_taipei,
                 post["permalink"]
             ))
             print(f"🔄 更新：{post['code']}")
 
+        # =======================================================
+        # INSERT — 欄位 mapping 全修正
+        # =======================================================
         else:
             cursor.execute("""
                 INSERT INTO social_posts (
@@ -133,15 +151,19 @@ def upsert_post(post, metrics):
                     threads_share_count, threads_repost_count,
                     threads_topic, created_at, updated_at
                 )
-                VALUES (%s,%s,%s,%s,%s,
-                        'threads','threads','THREADS','threads專案',
-                        %s,%s,%s,%s,%s,%s,%s)
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    'threads', 'threads', 'THREADS', 'threads專案',
+                    %s, %s, %s, %s,
+                    %s, %s, %s
+                )
             """, (
                 post_time_taipei,
                 post.get("keywordText"),
                 post.get("caption"),
                 post.get("permalink"),
-                post.get("username"),   # ← 正確：避免覆蓋成 threads專案
+                post.get("username"),
+
                 metrics["likeCount"],
                 metrics["directReplyCount"],
                 metrics["shares"],
@@ -160,7 +182,7 @@ def upsert_post(post, metrics):
         conn.rollback()
 
 # =======================================================
-# 手動匯入 — 前 10 筆
+# 手動匯入
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
@@ -178,7 +200,7 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# ⭐ 定時排程 — 每小時整點 → 抓前 3~2 小時貼文
+# ⭐ 定時排程：抓前 3～2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
@@ -190,8 +212,7 @@ def job_import_last_2_to_3_hours():
     total = 0
 
     for group in get_keyword_groups():
-        posts = get_posts_by_group(group["id"])
-        for p in posts:
+        for p in get_posts_by_group(group["id"]):
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
             if start_time <= t <= end_time:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
@@ -208,7 +229,6 @@ scheduler = BackgroundScheduler()
 
 scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
 scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
-
 scheduler.start()
 
 @app.route("/health")
