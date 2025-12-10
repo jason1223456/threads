@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
-
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # =======================================================
@@ -37,7 +36,6 @@ def get_keyword_groups():
 def get_posts_by_group(group_id):
     posts = []
     page = 1
-
     while True:
         r = requests.get(
             f"{API_DOMAIN}/keyword-groups/analytics/{group_id}",
@@ -48,10 +46,8 @@ def get_posts_by_group(group_id):
         chunk = r.json().get("posts", [])
         if not chunk:
             break
-
         posts.extend(chunk)
         page += 1
-
     return posts
 
 def get_metrics(code):
@@ -64,7 +60,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# METRICS NORMALIZATION
+# NORMALIZE METRICS
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -77,20 +73,21 @@ def normalize_metrics(m):
 def pick_best_metrics(metrics):
     if not metrics:
         return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
-
     for m in metrics:
         nm = normalize_metrics(m)
         if any([nm["likeCount"], nm["directReplyCount"], nm["shares"], nm["repostCount"]]):
             return nm
-
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS (channel 永遠是 threads專案)
+# DB FUNCTIONS (channel 永遠 threads專案 + api_source threadslytics)
 # =======================================================
 def get_existing_post(permalink):
     try:
-        cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
+        cursor.execute(
+            "SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", 
+            (permalink,)
+        )
         return cursor.fetchone()
     except Exception:
         conn.rollback()
@@ -102,10 +99,11 @@ def upsert_post(post, metrics):
         post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
         now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
 
-        existing = get_existing_post(post["permalink"])
+        permalink = post["permalink"]
+        existing = get_existing_post(permalink)
 
         # =======================================================
-        # UPDATE — 修正 channel 永遠為 threads專案
+        # UPDATE
         # =======================================================
         if existing:
             cursor.execute("""
@@ -118,6 +116,7 @@ def upsert_post(post, metrics):
                     media_name='threads',
                     site='THREADS',
                     channel='threads專案',
+                    api_source='threadslytics',
                     threads_like_count=%s,
                     threads_comment_count=%s,
                     threads_share_count=%s,
@@ -135,25 +134,25 @@ def upsert_post(post, metrics):
                 metrics["repostCount"],
                 post.get("tagHeader"),
                 now_taipei,
-                post["permalink"]
+                permalink
             ))
             print(f"🔄 更新：{post['code']}")
 
         # =======================================================
-        # INSERT — 欄位 mapping 全修正
+        # INSERT
         # =======================================================
         else:
             cursor.execute("""
                 INSERT INTO social_posts (
                     date, keyword, content, permalink, poster_name,
-                    media_title, media_name, site, channel,
+                    media_title, media_name, site, channel, api_source,
                     threads_like_count, threads_comment_count,
                     threads_share_count, threads_repost_count,
                     threads_topic, created_at, updated_at
                 )
                 VALUES (
                     %s, %s, %s, %s, %s,
-                    'threads', 'threads', 'THREADS', 'threads專案',
+                    'threads', 'threads', 'THREADS', 'threads專案', 'threadslytics',
                     %s, %s, %s, %s,
                     %s, %s, %s
                 )
@@ -161,7 +160,7 @@ def upsert_post(post, metrics):
                 post_time_taipei,
                 post.get("keywordText"),
                 post.get("caption"),
-                post.get("permalink"),
+                permalink,
                 post.get("username"),
 
                 metrics["likeCount"],
@@ -182,12 +181,11 @@ def upsert_post(post, metrics):
         conn.rollback()
 
 # =======================================================
-# 手動匯入
+# 手動匯入 10
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
     total = 0
-
     for group in get_keyword_groups():
         posts = get_posts_by_group(group["id"])
         for p in posts:
@@ -200,7 +198,7 @@ def manual_import_10():
             print(f"🆕 第 {total} 筆：{p['code']}")
 
 # =======================================================
-# ⭐ 定時排程：抓前 3～2 小時貼文
+# 每小時抓前 3~2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
@@ -208,7 +206,6 @@ def job_import_last_2_to_3_hours():
     now = datetime.now(timezone.utc)
     start_time = now - timedelta(hours=3)
     end_time = now - timedelta(hours=2)
-
     total = 0
 
     for group in get_keyword_groups():
@@ -222,7 +219,7 @@ def job_import_last_2_to_3_hours():
     print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
 
 # =======================================================
-# Flask + APScheduler
+# Flask + Scheduler
 # =======================================================
 app = Flask(__name__)
 scheduler = BackgroundScheduler()
