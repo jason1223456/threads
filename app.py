@@ -16,7 +16,7 @@ SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
 SMTP_USER = "jason91082500@gmail.com"
 
-# Google App Password（這裡可以用有空格的版本，程式會自動去掉）
+# 這裡保留你原本看到有空格的格式，程式自動去空白
 RAW_SMTP_PASS = "rwun dvta ybzr gzlz"
 SMTP_PASS = RAW_SMTP_PASS.replace(" ", "").replace("\u00a0", "")
 
@@ -230,19 +230,19 @@ def upsert_post(post, metrics):
 
 
 # =======================================================
-# 手動匯入前 10 筆（結束寄一封摘要信，帶關鍵字群組）
+# 手動匯入前 10 筆（結束寄一封摘要信，按 groupName 統計）
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
 
-    # group_name -> {'insert': x, 'update': y, 'total': z}
+    # groupName -> {'insert': x, 'update': y, 'total': z}
     group_stats = {}
     total = 0
 
     groups = get_keyword_groups()
 
     for group in groups:
-        group_name = group["name"]
+        group_name = group.get("groupName", "未知群組")  # ⭐ 用 groupName
         posts = get_posts_by_group(group["id"])
 
         for p in posts:
@@ -282,13 +282,13 @@ def manual_import_10():
             lines.append(f"  🔄 更新：{stat['update']} 筆\n")
 
     body = "\n".join(lines)
-    send_email("Threads 手動匯入前 10 筆摘要", body)
+    send_email("Threads 手動匯入前 10 筆摘要（依關鍵字群組）", body)
 
     print("\n🎉 手動匯入完成，已寄出摘要 email")
 
 
 # =======================================================
-# 每小時：抓前 3～2 小時的貼文（依群組統計，結束寄一封信）
+# 每小時：抓前 3～2 小時的貼文（依 groupName 統計）
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n===== ⏰ 每小時 Threads 匯入任務開始 =====")
@@ -300,10 +300,10 @@ def job_import_last_2_to_3_hours():
     groups = get_keyword_groups()
 
     lines = []
-    lines.append(f"時間區間：{start_time} ～ {end_time}\n")
+    lines.append(f"時間區間（UTC）：{start_time} ～ {end_time}\n")
 
     for group in groups:
-        group_name = group["name"]
+        group_name = group.get("groupName", "未知群組")  # ⭐ 用 groupName
         posts = get_posts_by_group(group["id"])
 
         group_insert = 0
@@ -320,7 +320,7 @@ def job_import_last_2_to_3_hours():
         # 沒有貼文
         if not filtered:
             lines.append(f"🔍 關鍵字群組：{group_name}")
-            lines.append("  ⚠️ 最近 1 小時內無貼文，不寫入資料庫\n")
+            lines.append("  ⚠️ 這個時間區間內沒有貼文，不寫入資料庫\n")
             continue
 
         # 有貼文 → 寫入
@@ -341,7 +341,7 @@ def job_import_last_2_to_3_hours():
         lines.append(f"  🔄 更新：{group_update}\n")
 
     body = "\n".join(lines)
-    send_email("Threads 每小時匯入摘要（含關鍵字群組）", body)
+    send_email("Threads 每小時匯入摘要（依關鍵字群組）", body)
 
     print("🎉 每小時任務完成，已寄出摘要 email")
 
