@@ -4,36 +4,40 @@ from psycopg.rows import dict_row
 from flask import Flask
 from apscheduler.schedulers.background import BackgroundScheduler
 from datetime import datetime, timedelta, timezone
+
 import smtplib
 from email.mime.text import MIMEText
-from email.header import Header
+from email.mime.multipart import MIMEMultipart
 
 # =======================================================
-# Gmail SMTP 設定（你要修改這裡）
+# ✉️ Gmail 寄信設定（直接填寫）
 # =======================================================
 SMTP_USER = "jason91082500@gmail.com"   # 例如：myaccount@gmail.com
-SMTP_PASS = "rwun dvta ybzr gzlz"         # ← Gmail App Password
-TO_EMAIL = "leona@brainmax-marketing.com"
+SMTP_PASS = "rwun dvta ybzr gzlz"          # ← 改這行
+TO_EMAIL  = "leona@brainmax-marketing.com"
 
-def send_mail(subject, body):
-    """寄信給 Leona"""
+def send_email(subject: str, body: str, to: str = TO_EMAIL):
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = to
+    msg["Subject"] = subject
+
+    # 用 UTF-8 避免 ascii encode 錯誤
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
     try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = SMTP_USER
-        msg["To"] = TO_EMAIL
-
-        with smtplib.SMTP("smtp.gmail.com", 587) as server:
-            server.starttls()
-            server.login(SMTP_USER, SMTP_PASS)
-            server.sendmail(SMTP_USER, [TO_EMAIL], msg.as_string())
-
-        print("📧 已寄信給 Leona")
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, [to], msg.as_string())
+        server.quit()
+        print(f"📧 Email 已寄出 → {subject}")
     except Exception as e:
-        print("❌ 寄信失敗：", e)
+        print("❌ Email 寄送失敗：", e)
+
 
 # =======================================================
-# API TOKEN
+# API 設定
 # =======================================================
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
@@ -44,8 +48,7 @@ TAIPEI_OFFSET = timedelta(hours=8)
 # PostgreSQL
 # =======================================================
 DATABASE_URL = (
-    "postgresql://root:"
-    "L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz"
+    "postgresql://root:L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz"
     "@sfo1.clusters.zeabur.com:30599/zeabur"
 )
 
@@ -86,6 +89,7 @@ def get_metrics(code):
     r.raise_for_status()
     return r.json().get("data", [])
 
+
 # =======================================================
 # NORMALIZE METRICS
 # =======================================================
@@ -106,8 +110,9 @@ def pick_best_metrics(metrics):
             return nm
     return normalize_metrics(metrics[0])
 
+
 # =======================================================
-# DB FUNCTIONS
+# DB FUNCTIONS — channel = 'threads專案' + api_source='threadslytics'
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -117,7 +122,9 @@ def get_existing_post(permalink):
         conn.rollback()
         return None
 
+
 def upsert_post(post, metrics):
+    status = ""  # 用來記錄匯入成功 / 更新 / 失敗
     try:
         post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
@@ -126,27 +133,16 @@ def upsert_post(post, metrics):
         permalink = post["permalink"]
         existing = get_existing_post(permalink)
 
-        # =======================================================
-        # UPDATE
-        # =======================================================
+        # ================= UPDATE =================
         if existing:
             cursor.execute("""
                 UPDATE social_posts
-                SET 
-                    keyword=%s,
-                    content=%s,
-                    poster_name=%s,
-                    media_title='threads',
-                    media_name='threads',
-                    site='THREADS',
-                    channel='threads專案',
-                    api_source='threadslytics',
-                    threads_like_count=%s,
-                    threads_comment_count=%s,
-                    threads_share_count=%s,
-                    threads_repost_count=%s,
-                    threads_topic=%s,
-                    updated_at=%s
+                SET keyword=%s, content=%s, poster_name=%s,
+                    media_title='threads', media_name='threads',
+                    site='THREADS', channel='threads專案', api_source='threadslytics',
+                    threads_like_count=%s, threads_comment_count=%s,
+                    threads_share_count=%s, threads_repost_count=%s,
+                    threads_topic=%s, updated_at=%s
                 WHERE permalink=%s
             """, (
                 post.get("keywordText"),
@@ -160,11 +156,9 @@ def upsert_post(post, metrics):
                 now_taipei,
                 permalink
             ))
-            print(f"🔄 更新：{post['code']}")
+            status = f"更新：{post['code']}"
 
-        # =======================================================
-        # INSERT
-        # =======================================================
+        # ================= INSERT =================
         else:
             cursor.execute("""
                 INSERT INTO social_posts (
@@ -186,7 +180,6 @@ def upsert_post(post, metrics):
                 post.get("caption"),
                 permalink,
                 post.get("username"),
-
                 metrics["likeCount"],
                 metrics["directReplyCount"],
                 metrics["shares"],
@@ -195,47 +188,44 @@ def upsert_post(post, metrics):
                 now_taipei,
                 now_taipei
             ))
-            print(f"🆕 新增：{post['code']}")
-
-            # ⭐⭐⭐ 新增時寄信
-            send_mail(
-                subject="Threads 新增貼文通知",
-                body=f"新增貼文：{post['permalink']}\n使用者：{post.get('username')}"
-            )
+            status = f"新增：{post['code']}"
 
         conn.commit()
+        print("🟢", status)
+        send_email("Threads 匯入成功", status)
 
     except Exception as e:
-        print("❌ 寫入錯誤 — rollback")
-        print(e)
+        error_msg = f"❌ 匯入失敗：{post.get('code')} → {e}"
+        print(error_msg)
         conn.rollback()
+        send_email("❌ Threads 匯入失敗", error_msg)
+
 
 # =======================================================
-# 手動匯入 10
+# 手動匯入前 10
 # =======================================================
 def manual_import_10():
-    print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
+    print("\n===== 🚀 手動匯入 10 筆貼文 =====")
     total = 0
     for group in get_keyword_groups():
-        posts = get_posts_by_group(group["id"])
-        for p in posts:
+        for p in get_posts_by_group(group["id"]):
             if total >= 10:
-                print("\n🎉 已完成匯入 10 筆")
+                print("🎉 匯入完成 10 筆")
                 return
             metrics = pick_best_metrics(get_metrics(p["code"]))
             upsert_post(p, metrics)
             total += 1
             print(f"🆕 第 {total} 筆：{p['code']}")
 
+
 # =======================================================
-# 每小時抓前 3~2 小時貼文
+# 每小時抓前 3~2 小時
 # =======================================================
 def job_import_last_2_to_3_hours():
-    print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
-
+    print("\n⏰ 執行定時匯入（前 3～2 小時）")
     now = datetime.now(timezone.utc)
     start_time = now - timedelta(hours=3)
-    end_time = now - timedelta(hours=2)
+    end_time   = now - timedelta(hours=2)
     total = 0
 
     for group in get_keyword_groups():
@@ -246,7 +236,8 @@ def job_import_last_2_to_3_hours():
                 upsert_post(p, metrics)
                 total += 1
 
-    print(f"✨ 本次排程匯入 {total} 筆（{start_time} ～ {end_time}）")
+    send_email("⏰ 定時匯入完成", f"本次共匯入：{total} 筆")
+
 
 # =======================================================
 # Flask + Scheduler
@@ -265,6 +256,7 @@ def health():
 @app.route("/")
 def index():
     return "Threads SocialPosts Crawler Running"
+
 
 if __name__ == "__main__":
     manual_import_10()
