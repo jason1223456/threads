@@ -7,7 +7,28 @@ from datetime import datetime, timedelta, timezone
 import smtplib
 from email.mime.text import MIMEText
 from email.header import Header
-import os
+
+# =======================================================
+# EMAIL CONFIG
+# =======================================================
+SMTP_USER = "jason91082500@gmail.com"   
+SMTP_PASS = "rwun dvta ybzr gzlz"    
+EMAIL_TO = "leona@brainmax-marketing.com"
+
+def send_email(subject, body):
+    try:
+        msg = MIMEText(body, "plain", "utf-8")
+        msg["Subject"] = Header(subject, "utf-8")
+        msg["From"] = SMTP_USER
+        msg["To"] = EMAIL_TO
+
+        server = smtplib.SMTP_SSL("smtp.gmail.com", 465)
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, EMAIL_TO, msg.as_string())
+        server.quit()
+        print("📧 Email 寄送成功")
+    except Exception as e:
+        print(f"❌ Email 寄送失敗： {e}")
 
 # =======================================================
 # API TOKEN
@@ -16,15 +37,6 @@ API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 TAIPEI_OFFSET = timedelta(hours=8)
-
-# =======================================================
-# EMAIL SETTING (建議放環境變數)
-# =======================================================
-SMTP_SERVER = "smtp.gmail.com"
-SMTP_PORT = 587
-SMTP_USER = "jason91082500@gmail.com"   # 例如：myaccount@gmail.com
-SMTP_PASS = "rwun dvta ybzr gzlz"   
-EMAIL_TO = "leona@brainmax-marketing.com"
 
 # =======================================================
 # PostgreSQL
@@ -37,27 +49,6 @@ DATABASE_URL = (
 
 conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
 cursor = conn.cursor()
-
-# =======================================================
-# EMAIL FUNCTION
-# =======================================================
-def send_email(subject, body):
-    """寄信（UTF-8 避免 ASCII Error）"""
-    try:
-        msg = MIMEText(body, "plain", "utf-8")
-        msg["Subject"] = Header(subject, "utf-8")
-        msg["From"] = SMTP_USER
-        msg["To"] = EMAIL_TO
-
-        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASS)
-            s.send_message(msg)
-
-        print("📧 Email 已寄送")
-
-    except Exception as e:
-        print("❌ Email 寄送失敗：", e)
 
 # =======================================================
 # API FUNCTIONS
@@ -94,7 +85,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# METRICS NORMALIZATION
+# NORMALIZE METRICS
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -117,11 +108,14 @@ def pick_best_metrics(metrics):
 # DB FUNCTIONS
 # =======================================================
 def get_existing_post(permalink):
-    cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
-    return cursor.fetchone()
+    try:
+        cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
+        return cursor.fetchone()
+    except Exception:
+        conn.rollback()
+        return None
 
-def upsert_post(post, metrics, group_name, summary_list):
-    """寫入 + 收集 email summary"""
+def upsert_post(post, metrics, group_name, result_list):
     try:
         post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
@@ -130,41 +124,7 @@ def upsert_post(post, metrics, group_name, summary_list):
 
         existing = get_existing_post(permalink)
 
-        status = "更新" if existing else "新增"
-
-        # INSERT
-        if not existing:
-            cursor.execute("""
-                INSERT INTO social_posts (
-                    date, keyword, content, permalink, poster_name,
-                    media_title, media_name, site, channel, api_source,
-                    threads_like_count, threads_comment_count,
-                    threads_share_count, threads_repost_count,
-                    threads_topic, created_at, updated_at
-                )
-                VALUES (
-                    %s,%s,%s,%s,%s,
-                    'threads','threads','THREADS','threads專案','threadslytics',
-                    %s,%s,%s,%s,
-                    %s,%s,%s
-                )
-            """, (
-                post_time_taipei,
-                post.get("keywordText"),
-                post.get("caption"),
-                permalink,
-                post.get("username"),
-                metrics["likeCount"],
-                metrics["directReplyCount"],
-                metrics["shares"],
-                metrics["repostCount"],
-                post.get("tagHeader"),
-                now_taipei,
-                now_taipei
-            ))
-
-        # UPDATE
-        else:
+        if existing:
             cursor.execute("""
                 UPDATE social_posts
                 SET keyword=%s, content=%s, poster_name=%s,
@@ -186,56 +146,71 @@ def upsert_post(post, metrics, group_name, summary_list):
                 now_taipei,
                 permalink
             ))
+            action = "更新"
+            print(f"🔄 更新：{post['code']}")
+
+        else:
+            cursor.execute("""
+                INSERT INTO social_posts (
+                    date, keyword, content, permalink, poster_name,
+                    media_title, media_name, site, channel, api_source,
+                    threads_like_count, threads_comment_count,
+                    threads_share_count, threads_repost_count,
+                    threads_topic, created_at, updated_at
+                )
+                VALUES (
+                    %s, %s, %s, %s, %s,
+                    'threads', 'threads', 'THREADS', 'threads專案', 'threadslytics',
+                    %s, %s, %s, %s,
+                    %s, %s, %s
+                )
+            """, (
+                post_time_taipei,
+                post.get("keywordText"),
+                post.get("caption"),
+                permalink,
+                post.get("username"),
+                metrics["likeCount"],
+                metrics["directReplyCount"],
+                metrics["shares"],
+                metrics["repostCount"],
+                post.get("tagHeader"),
+                now_taipei,
+                now_taipei
+            ))
+            action = "新增"
+            print(f"🆕 新增：{post['code']}")
 
         conn.commit()
 
-        # 收集寄信內容
-        summary_list.append({
-            "status": status,
-            "code": post["code"],
-            "metrics": metrics,
-            "groupName": group_name
-        })
+        # ⭐ 寫入 email summary
+        result_list.append(
+            f"[{group_name}] ({action}) {post['code']} — {permalink}"
+        )
 
     except Exception as e:
-        print("❌ 寫入錯誤 — rollback", e)
+        print("❌ 寫入錯誤 — rollback")
+        print(e)
         conn.rollback()
 
 # =======================================================
-# EMAIL SUMMARY FORMAT
+# 📌 Email Summary Formatter
 # =======================================================
-def format_summary_email(summary_list):
-    if not summary_list:
-        return "沒有新增或更新資料。"
+def format_summary_email(result_list, title="Threads 匯入結果"):
+    if not result_list:
+        return f"{title}\n\n⚠️ 本次無任何貼文更新或新增。"
 
-    output = ""
-
-    # 依群組分類
-    groups = {}
-    for item in summary_list:
-        groups.setdefault(item["groupName"], []).append(item)
-
-    for group, items in groups.items():
-        output += f"📌 群組：{group}\n\n"
-        for i in items:
-            output += (
-                f"{'🆕' if i['status']=='新增' else '🔄'} {i['code']}\n"
-                f"    👍 {i['metrics']['likeCount']}   "
-                f"💬 {i['metrics']['directReplyCount']}   "
-                f"↗️ {i['metrics']['shares']}   "
-                f"🔁 {i['metrics']['repostCount']}\n\n"
-            )
-        output += "\n-------------------------\n\n"
-
-    return output
+    body = f"{title}\n\n"
+    body += "\n".join(result_list)
+    return body
 
 # =======================================================
-# 手動匯入前 10
+# 手動匯入 10 筆
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
-    
-    summary_list = []
+
+    summary = []
     count = 0
 
     for group in get_keyword_groups():
@@ -246,38 +221,46 @@ def manual_import_10():
                 break
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
-            upsert_post(p, metrics, group_name, summary_list)
+            upsert_post(p, metrics, group_name, summary)
 
             count += 1
+            print(f"🆕 第 {count} 筆：{p['code']}")
 
-    # 寄信
-    email_body = format_summary_email(summary_list)
-    send_email("Threads 手動匯入結果通知", email_body)
+        if count >= 10:
+            break
+
+    # ⭐ 寄出總結信
+    email_body = format_summary_email(summary, "手動匯入完成（前 10 筆）")
+    send_email("Threads 手動匯入通知", email_body)
 
 # =======================================================
-# 每小時排程：抓前 3~2 小時
+# 定時：每小時抓前 3～2 小時貼文
 # =======================================================
 def job_import_last_2_to_3_hours():
     print("\n⏰ 定時任務：抓前 3～2 小時貼文 → social_posts")
 
     now = datetime.now(timezone.utc)
-    start_time = now - timedelta(hours=3)
-    end_time = now - timedelta(hours=2)
+    start = now - timedelta(hours=3)
+    end = now - timedelta(hours=2)
 
-    summary_list = []
+    summary = []
+    total = 0
 
     for group in get_keyword_groups():
         group_name = group.get("groupName", "未命名群組")
 
         for p in get_posts_by_group(group["id"]):
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-            if start_time <= t <= end_time:
+            if start <= t <= end:
                 metrics = pick_best_metrics(get_metrics(p["code"]))
-                upsert_post(p, metrics, group_name, summary_list)
+                upsert_post(p, metrics, group_name, summary)
+                total += 1
 
-    # 排程也寄信
-    email_body = format_summary_email(summary_list)
-    send_email("Threads 每小時更新通知", email_body)
+    print(f"✨ 本次排程匯入 {total} 筆")
+
+    # ⭐ 寄信
+    email_body = format_summary_email(summary, "每小時排程匯入結果")
+    send_email("Threads 每小時排程通知", email_body)
 
 # =======================================================
 # Flask + Scheduler
