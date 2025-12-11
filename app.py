@@ -32,12 +32,12 @@ cursor = conn.cursor()
 # EMAIL CONFIG
 # =======================================================
 SMTP_USER = "jason91082500@gmail.com"
-SMTP_PASS = "rwun dvta ybzr gzlz"     # ← 你要填入自己 Gmail App Password
+SMTP_PASS = "rwun dvta ybzr gzlz"     # ← Gmail App Password
 SMTP_TO = "leona@brainmax-marketing.com"
 
 def send_email(subject, text):
     try:
-        msg = MIMEText(text, "plain", "utf-8")
+        msg = MIMEText(text.encode("utf-8"), "plain", "utf-8")  # 🔥 強制 UTF-8
         msg["Subject"] = Header(subject, "utf-8")
         msg["From"] = SMTP_USER
         msg["To"] = SMTP_TO
@@ -106,7 +106,7 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS（return insert/update/skip）
+# DB FUNCTIONS（insert / update / skip）
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -205,7 +205,7 @@ def upsert_post(post, metrics):
         return "skip"
 
 # =======================================================
-# 手動匯入 10
+# 手動匯入前 10
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆貼文 → social_posts =====")
