@@ -31,7 +31,7 @@ cursor = conn.cursor()
 # Gmail 設定
 # =======================================================
 SMTP_USER = "jason91082500@gmail.com"
-SMTP_PASS = "rwun dvta ybzr gzlz"  # ⚠ 16碼 Gmail App Password
+SMTP_PASS = "rwundvtaybzrgzlz"# ⚠ 16碼 Gmail App Password
 SMTP_TO = "leona@brainmax-marketing.com"
 
 def send_email(subject, body):
