@@ -14,6 +14,8 @@ from email.header import Header
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+
+# 時區設定
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # =======================================================
@@ -31,7 +33,7 @@ cursor = conn.cursor()
 # Gmail 設定
 # =======================================================
 SMTP_USER = "jason91082500@gmail.com"
-SMTP_PASS = "rwundvtaybzrgzlz"# ⚠ 16碼 Gmail App Password
+SMTP_PASS = "rwundvtaybzrgzlz"  # Gmail App Password（16碼）
 SMTP_TO = "leona@brainmax-marketing.com"
 
 def send_email(subject, body):
@@ -46,6 +48,7 @@ def send_email(subject, body):
             server.sendmail(SMTP_USER, SMTP_TO, msg.as_string())
 
         print("📧 Email 已送出")
+
     except Exception as e:
         print("❌ Email 寄送失敗：", e)
 
@@ -68,14 +71,12 @@ def get_posts_by_group(group_id):
             params={"metricDays": 7, "page": page}
         )
         r.raise_for_status()
-
         chunk = r.json().get("posts", [])
         if not chunk:
             break
 
         posts.extend(chunk)
         page += 1
-
     return posts
 
 def get_metrics(code):
@@ -88,7 +89,7 @@ def get_metrics(code):
     return r.json().get("data", [])
 
 # =======================================================
-# NORMALIZE METRICS
+# METRICS
 # =======================================================
 def normalize_metrics(m):
     return {
@@ -101,12 +102,10 @@ def normalize_metrics(m):
 def pick_best_metrics(metrics):
     if not metrics:
         return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
-
     for m in metrics:
         nm = normalize_metrics(m)
         if any(nm.values()):
             return nm
-
     return normalize_metrics(metrics[0])
 
 # =======================================================
@@ -122,15 +121,14 @@ def get_existing_post(permalink):
 
 def upsert_post(post, metrics):
     try:
-        post_time_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
-        post_time_taipei = (post_time_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-        now_taipei = (datetime.now(timezone.utc) + TAIPEI_OFFSET).replace(tzinfo=None)
+        post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
+        post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+        now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
 
         permalink = post["permalink"]
         exists = get_existing_post(permalink)
 
-        # UPDATE
-        if exists:
+        if exists:  # UPDATE
             cursor.execute("""
                 UPDATE social_posts
                 SET keyword=%s, content=%s, poster_name=%s,
@@ -141,16 +139,10 @@ def upsert_post(post, metrics):
                     threads_topic=%s, updated_at=%s
                 WHERE permalink=%s
             """, (
-                post.get("keywordText"),
-                post.get("caption"),
-                post.get("username"),
-                metrics["likeCount"],
-                metrics["directReplyCount"],
-                metrics["shares"],
-                metrics["repostCount"],
-                post.get("tagHeader"),
-                now_taipei,
-                permalink
+                post.get("keywordText"), post.get("caption"), post.get("username"),
+                metrics["likeCount"], metrics["directReplyCount"],
+                metrics["shares"], metrics["repostCount"],
+                post.get("tagHeader"), now_tw, permalink
             ))
             conn.commit()
             return "update"
@@ -171,40 +163,32 @@ def upsert_post(post, metrics):
                 %s, %s, %s
             )
         """, (
-            post_time_taipei,
-            post.get("keywordText"),
-            post.get("caption"),
-            permalink,
-            post.get("username"),
-            metrics["likeCount"],
-            metrics["directReplyCount"],
-            metrics["shares"],
-            metrics["repostCount"],
+            post_tw, post.get("keywordText"), post.get("caption"),
+            permalink, post.get("username"),
+            metrics["likeCount"], metrics["directReplyCount"],
+            metrics["shares"], metrics["repostCount"],
             post.get("tagHeader"),
-            now_taipei,
-            now_taipei
+            now_tw, now_tw
         ))
-
         conn.commit()
         return "insert"
 
     except Exception as e:
-        conn.rollback()
         print("DB Error:", e)
+        conn.rollback()
         return "skip"
 
 # =======================================================
-# 手動匯入前 10 筆 + Email
+# 手動匯入（前 10 筆）
 # =======================================================
 def manual_import_10():
-    print("\n===== 🚀 手動匯入 10 筆貼文 =====")
-
+    print("\n===== 🚀 手動匯入 10 筆 =====")
     total = 0
     groups = get_keyword_groups()
-    group_stats = {}
+    stats = {}
 
     for group in groups:
-        group_name = group.get("groupName", "未知群組")
+        gname = group.get("groupName", "未知群組")
         posts = get_posts_by_group(group["id"])
 
         for p in posts:
@@ -214,52 +198,58 @@ def manual_import_10():
             metrics = pick_best_metrics(get_metrics(p["code"]))
             result = upsert_post(p, metrics)
 
-            if group_name not in group_stats:
-                group_stats[group_name] = {"insert": 0, "update": 0, "total": 0}
+            if gname not in stats:
+                stats[gname] = {"insert": 0, "update": 0, "total": 0}
 
             if result in ["insert", "update"]:
-                group_stats[group_name][result] += 1
-                group_stats[group_name]["total"] += 1
+                stats[gname][result] += 1
+                stats[gname]["total"] += 1
 
             total += 1
 
         if total >= 10:
             break
 
-    # Build Email
+    # ===== Email =====
     lines = ["【手動匯入前 10 筆】\n"]
 
-    for g, stat in group_stats.items():
+    for g, s in stats.items():
         lines.append(f"🔍 關鍵字群組：{g}")
-        lines.append(f"📌 時段內貼文數：{stat['total']}")
-        lines.append(f"🆕 新增：{stat['insert']}")
-        lines.append(f"🔄 更新：{stat['update']}\n")
+        lines.append(f"📌 時段內貼文數：{s['total']}")
+        lines.append(f"🆕 新增：{s['insert']}")
+        lines.append(f"🔄 更新：{s['update']}\n")
 
     send_email("Threads 手動匯入摘要", "\n".join(lines))
-    print("📨 手動匯入 email 已寄出")
 
 # =======================================================
-# 每小時排程：抓前 3~2 小時 + Email
+# 每小時排程（前 3～2 小時）
 # =======================================================
 def job_import_last_2_to_3_hours():
-    print("\n===== ⏰ 每小時 Threads 匯入任務 =====")
+    print("\n===== ⏰ 每小時 Threads 匯入 =====")
 
     now = datetime.now(timezone.utc)
-    start_time = now - timedelta(hours=3)
-    end_time = now - timedelta(hours=2)
+    start = now - timedelta(hours=3)
+    end = now - timedelta(hours=2)
+
+    # ⭐ 台北時間
+    start_tw = (start + TAIPEI_OFFSET).replace(tzinfo=None)
+    end_tw = (end + TAIPEI_OFFSET).replace(tzinfo=None)
+
+    lines = [
+        f"時間區間：{start_tw.strftime('%Y-%m-%d %H:%M:%S')} ～ {end_tw.strftime('%Y-%m-%d %H:%M:%S')}\n"
+    ]
 
     groups = get_keyword_groups()
-    lines = [f"時間區間（UTC）：{start_time} ～ {end_time}\n"]
 
     for group in groups:
-        group_name = group.get("groupName", "未知群組")
+        gname = group.get("groupName", "未知群組")
         posts = get_posts_by_group(group["id"])
 
         stat = {"insert": 0, "update": 0, "total": 0}
 
         for p in posts:
             t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
-            if not (start_time <= t <= end_time):
+            if not (start <= t <= end):
                 continue
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
@@ -272,13 +262,12 @@ def job_import_last_2_to_3_hours():
         if stat["total"] == 0:
             continue
 
-        lines.append(f"🔍 關鍵字群組：{group_name}")
+        lines.append(f"🔍 關鍵字群組：{gname}")
         lines.append(f"📌 時段內貼文數：{stat['total']}")
         lines.append(f"🆕 新增：{stat['insert']}")
         lines.append(f"🔄 更新：{stat['update']}\n")
 
     send_email("Threads 每小時匯入摘要", "\n".join(lines))
-    print("📨 每小時 email 已寄出")
 
 # =======================================================
 # Flask + Scheduler
