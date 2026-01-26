@@ -1,3 +1,12 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Created on Tue Jan 27 04:05:07 2026
+
+@author: chenguanting
+"""
+
+import time
 import requests
 import psycopg
 from psycopg.rows import dict_row
@@ -9,29 +18,42 @@ from email.mime.text import MIMEText
 from email.header import Header
 
 # =======================================================
-# API TOKEN
+# API TOKEN (寫死版)
 # =======================================================
-API_TOKEN = "YOUR_API_TOKEN"
+API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
-REQ_TIMEOUT = 60  # 避免 ReadTimeout
+REQ_TIMEOUT = 60
 
 # 時區設定
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # =======================================================
-# PostgreSQL
+# PostgreSQL（寫死版，但改成 lazy connect）
 # =======================================================
-DATABASE_URL = "postgresql://USER:PASSWORD@HOST:PORT/DBNAME"
-conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-cursor = conn.cursor()
+DATABASE_URL = (
+    "postgresql://root:" "L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz" "@sfo1.clusters.zeabur.com:30599/zeabur"
+)
+
+_conn = None
+_cursor = None
+
+def get_db():
+    """需要用 DB 時才連線，避免 gunicorn import 階段直接爆掉"""
+    global _conn, _cursor
+    if _conn is not None and _cursor is not None:
+        return _conn, _cursor
+
+    _conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    _cursor = _conn.cursor()
+    return _conn, _cursor
 
 # =======================================================
-# Gmail 設定
+# Gmail 設定（寫死版）
 # =======================================================
-SMTP_USER = "YOUR_GMAIL"
-SMTP_PASS = "YOUR_APP_PASSWORD"
-SMTP_TO = "TO_EMAIL"
+SMTP_USER = "jason91082500@gmail.com"
+SMTP_PASS = "rwundvtaybzrgzlz"
+SMTP_TO = "leona@brainmax-marketing.com"
 
 def send_email(subject, body):
     try:
@@ -52,22 +74,20 @@ def send_email(subject, body):
 # DB: 修正 sequence（解 social_posts_pkey 重複）
 # =======================================================
 def fix_id_sequence(table_name: str, id_col: str = "id"):
-    """
-    修正 SERIAL/BIGSERIAL 的 sequence，避免 duplicate key on primary key
-    """
     try:
+        conn, cursor = get_db()
+
         cursor.execute("SELECT pg_get_serial_sequence(%s, %s) AS seq", (table_name, id_col))
         row = cursor.fetchone()
         seq_name = row["seq"] if row else None
 
         if not seq_name:
-            print(f"ℹ️ {table_name}.{id_col} 沒有 serial sequence（可能不是 SERIAL/BIGSERIAL），略過修正")
+            print(f"ℹ️ {table_name}.{id_col} 沒有 serial sequence，略過修正")
             return
 
         cursor.execute(f"SELECT COALESCE(MAX({id_col}), 1) AS max_id FROM {table_name}")
         max_id = cursor.fetchone()["max_id"]
 
-        # setval(seq, max_id+1, false) 讓下一次 nextval() 用 max_id+1
         cursor.execute("SELECT setval(%s, %s, false)", (seq_name, int(max_id) + 1))
         conn.commit()
 
@@ -75,47 +95,55 @@ def fix_id_sequence(table_name: str, id_col: str = "id"):
 
     except Exception as e:
         print("❌ 修正 sequence 失敗：", e)
-        conn.rollback()
+        try:
+            conn, _ = get_db()
+            conn.rollback()
+        except:
+            pass
 
 # =======================================================
-# API FUNCTIONS
+# API FUNCTIONS（加一點 retry，避免偶發 timeout）
 # =======================================================
+session = requests.Session()
+
+def api_get_json(url, params=None, retries=3):
+    last = None
+    for i in range(1, retries + 1):
+        try:
+            r = session.get(url, headers=HEADERS, params=params, timeout=REQ_TIMEOUT)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            sleep_s = 1.5 ** (i - 1)
+            print(f"⚠️ API 失敗重試 {i}/{retries}: {e} (sleep {sleep_s:.1f}s)")
+            time.sleep(sleep_s)
+    raise last
+
 def get_keyword_groups():
-    r = requests.get(f"{API_DOMAIN}/keyword-groups", headers=HEADERS, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    return r.json()["data"]
+    return api_get_json(f"{API_DOMAIN}/keyword-groups")["data"]
 
 def get_posts_by_group(group_id):
     posts = []
     page = 1
-
     while True:
-        r = requests.get(
+        data = api_get_json(
             f"{API_DOMAIN}/keyword-groups/analytics/{group_id}",
-            headers=HEADERS,
             params={"metricDays": 7, "page": page},
-            timeout=REQ_TIMEOUT
         )
-        r.raise_for_status()
-
-        chunk = r.json().get("posts", [])
+        chunk = data.get("posts", [])
         if not chunk:
             break
-
         posts.extend(chunk)
         page += 1
-
     return posts
 
 def get_metrics(code):
-    r = requests.get(
+    data = api_get_json(
         f"{API_DOMAIN}/threads/post/metrics",
-        headers=HEADERS,
         params={"code": code},
-        timeout=REQ_TIMEOUT
     )
-    r.raise_for_status()
-    return r.json().get("data", [])
+    return data.get("data", [])
 
 # =======================================================
 # METRICS
@@ -142,10 +170,15 @@ def pick_best_metrics(metrics):
 # =======================================================
 def get_existing_post(permalink):
     try:
+        conn, cursor = get_db()
         cursor.execute("SELECT 1 FROM social_posts WHERE permalink=%s LIMIT 1", (permalink,))
         return cursor.fetchone()
     except:
-        conn.rollback()
+        try:
+            conn, _ = get_db()
+            conn.rollback()
+        except:
+            pass
         return None
 
 def upsert_post(post, metrics):
@@ -153,6 +186,8 @@ def upsert_post(post, metrics):
     保留原本 social_posts 行為：permalink 唯一，一篇貼文只存一筆
     """
     try:
+        conn, cursor = get_db()
+
         post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
         now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
@@ -160,7 +195,7 @@ def upsert_post(post, metrics):
         permalink = post["permalink"]
         exists = get_existing_post(permalink)
 
-        if exists:  # UPDATE
+        if exists:
             cursor.execute("""
                 UPDATE social_posts
                 SET keyword=%s, content=%s, poster_name=%s,
@@ -179,7 +214,6 @@ def upsert_post(post, metrics):
             conn.commit()
             return "update"
 
-        # INSERT
         cursor.execute("""
             INSERT INTO social_posts (
                 date, keyword, content, permalink, poster_name,
@@ -206,68 +240,40 @@ def upsert_post(post, metrics):
         return "insert"
 
     except Exception as e:
-        # ✅ 如果又遇到 sequence 不同步，直接修一次再重試一次 INSERT（最省事）
         msg = str(e)
         if "duplicate key value violates unique constraint" in msg and "social_posts_pkey" in msg:
-            print("⚠️ social_posts_pkey 重複，嘗試自動修正 sequence 後重試一次…")
-            conn.rollback()
-            fix_id_sequence("social_posts", "id")
-
+            print("⚠️ social_posts_pkey 重複，修正 sequence 後重試一次…")
             try:
-                # 重試一次（只重試 insert path：簡單處理）
-                post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
-                post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-                now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
-
-                cursor.execute("""
-                    INSERT INTO social_posts (
-                        date, keyword, content, permalink, poster_name,
-                        media_title, media_name, site, channel, api_source,
-                        threads_like_count, threads_comment_count,
-                        threads_share_count, threads_repost_count,
-                        threads_topic, created_at, updated_at
-                    )
-                    VALUES (
-                        %s, %s, %s, %s, %s,
-                        'threads','threads','THREADS','threads專案','threadslytics',
-                        %s, %s, %s, %s,
-                        %s, %s, %s
-                    )
-                """, (
-                    post_tw, post.get("keywordText"), post.get("caption"),
-                    post["permalink"], post.get("username"),
-                    metrics["likeCount"], metrics["directReplyCount"],
-                    metrics["shares"], metrics["repostCount"],
-                    post.get("tagHeader"),
-                    now_tw, now_tw
-                ))
-                conn.commit()
-                return "insert"
-
+                conn, _ = get_db()
+                conn.rollback()
+            except:
+                pass
+            fix_id_sequence("social_posts", "id")
+            # 重試一次
+            try:
+                return upsert_post(post, metrics)
             except Exception as e2:
                 print("DB Error (social_posts) retry failed:", e2)
-                conn.rollback()
                 return "skip"
 
         print("DB Error (social_posts):", e)
-        conn.rollback()
+        try:
+            conn, _ = get_db()
+            conn.rollback()
+        except:
+            pass
         return "skip"
 
 # =======================================================
 # DB FUNCTIONS (social_posts_events 事件表)
 # =======================================================
 def upsert_event(post, group_name, metrics):
-    """
-    social_posts_events：一筆 = 一次命中事件（permalink + group + keyword）
-    """
     try:
+        conn, cursor = get_db()
+
         post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
         now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
-
-        permalink = post["permalink"]
-        keyword_text = post.get("keywordText")
-        code = post.get("code")
 
         cursor.execute("""
             INSERT INTO social_posts_events (
@@ -298,8 +304,8 @@ def upsert_event(post, group_name, metrics):
                 threads_repost_count = EXCLUDED.threads_repost_count,
                 updated_at = EXCLUDED.updated_at
         """, (
-            post_tw, permalink, code,
-            group_name, keyword_text,
+            post_tw, post.get("permalink"), post.get("code"),
+            group_name, post.get("keywordText"),
             post.get("username"), post.get("caption"), post.get("tagHeader"),
             metrics["likeCount"], metrics["directReplyCount"],
             metrics["shares"], metrics["repostCount"],
@@ -310,16 +316,18 @@ def upsert_event(post, group_name, metrics):
 
     except Exception as e:
         print("DB Error (social_posts_events):", e)
-        conn.rollback()
+        try:
+            conn, _ = get_db()
+            conn.rollback()
+        except:
+            pass
         return "skip"
 
 # =======================================================
-# 手動匯入（前 10 筆）
+# JOBS
 # =======================================================
 def manual_import_10():
     print("\n===== 🚀 手動匯入 10 筆 =====")
-
-    # ✅ 每次啟動先修一次 sequence（避免你剛剛的錯）
     fix_id_sequence("social_posts", "id")
 
     total = 0
@@ -336,12 +344,11 @@ def manual_import_10():
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
 
-            result = upsert_post(p, metrics)      # 原表：貼文表
-            upsert_event(p, gname, metrics)       # 新表：事件表（2000+）
+            result = upsert_post(p, metrics)
+            upsert_event(p, gname, metrics)
 
             if gname not in stats:
                 stats[gname] = {"insert": 0, "update": 0, "total": 0}
-
             if result in ["insert", "update"]:
                 stats[gname][result] += 1
                 stats[gname]["total"] += 1
@@ -360,13 +367,8 @@ def manual_import_10():
 
     send_email("Threads 手動匯入摘要", "\n".join(lines))
 
-# =======================================================
-# 每小時排程（前 3～2 小時）
-# =======================================================
 def job_import_last_2_to_3_hours():
     print("\n===== ⏰ 每小時 Threads 匯入 =====")
-
-    # ✅ 每次 job 開始也修一次（保險）
     fix_id_sequence("social_posts", "id")
 
     now = datetime.now(timezone.utc)
@@ -394,7 +396,6 @@ def job_import_last_2_to_3_hours():
                 continue
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
-
             result = upsert_post(p, metrics)
             upsert_event(p, gname, metrics)
 
@@ -413,26 +414,35 @@ def job_import_last_2_to_3_hours():
     send_email("Threads 每小時匯入摘要", "\n".join(lines))
 
 # =======================================================
-# Flask + Scheduler
+# Flask + Scheduler（放在 create_app 裡，避免 import 就啟動）
 # =======================================================
-app = Flask(__name__)
-scheduler = BackgroundScheduler()
+def create_app():
+    app = Flask(__name__)
 
-scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
-scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
-scheduler.start()
+    scheduler = BackgroundScheduler()
+    scheduler.add_job(job_import_last_2_to_3_hours, "cron", minute=0)
+    scheduler.add_job(manual_import_10, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
+    scheduler.start()
 
-@app.route("/health")
-def health():
-    return "OK", 200
+    @app.route("/health")
+    def health():
+        # DB 壞掉也不要讓服務起不來
+        try:
+            conn, cursor = get_db()
+            cursor.execute("SELECT 1;")
+            return "OK", 200
+        except Exception as e:
+            return f"DB_NOT_READY: {e}", 200
 
-@app.route("/")
-def index():
-    return "Threads Crawler Running"
+    @app.route("/")
+    def index():
+        return "Threads Crawler Running"
+
+    return app
+
+# gunicorn 入口
+app = create_app()
 
 if __name__ == "__main__":
-    # ✅ 啟動時先修一次（再保險）
-    fix_id_sequence("social_posts", "id")
-
-    manual_import_10()
+    # 本機執行用
     app.run(host="0.0.0.0", port=5000)
