@@ -14,6 +14,7 @@ from email.header import Header
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+REQ_TIMEOUT = 60  # ✅ 避免 ReadTimeout，拉長一點
 
 # 時區設定
 TAIPEI_OFFSET = timedelta(hours=8)
@@ -33,7 +34,7 @@ cursor = conn.cursor()
 # Gmail 設定
 # =======================================================
 SMTP_USER = "jason91082500@gmail.com"
-SMTP_PASS = "rwundvtaybzrgzlz"  # Gmail App Password（16碼）
+SMTP_PASS = "rwundvtaybzrgzlz"
 SMTP_TO = "leona@brainmax-marketing.com"
 
 def send_email(subject, body):
@@ -48,7 +49,6 @@ def send_email(subject, body):
             server.sendmail(SMTP_USER, SMTP_TO, msg.as_string())
 
         print("📧 Email 已送出")
-
     except Exception as e:
         print("❌ Email 寄送失敗：", e)
 
@@ -56,7 +56,7 @@ def send_email(subject, body):
 # API FUNCTIONS
 # =======================================================
 def get_keyword_groups():
-    r = requests.get(f"{API_DOMAIN}/keyword-groups", headers=HEADERS)
+    r = requests.get(f"{API_DOMAIN}/keyword-groups", headers=HEADERS, timeout=REQ_TIMEOUT)
     r.raise_for_status()
     return r.json()["data"]
 
@@ -68,7 +68,8 @@ def get_posts_by_group(group_id):
         r = requests.get(
             f"{API_DOMAIN}/keyword-groups/analytics/{group_id}",
             headers=HEADERS,
-            params={"metricDays": 7, "page": page}
+            params={"metricDays": 7, "page": page},
+            timeout=REQ_TIMEOUT
         )
         r.raise_for_status()
         chunk = r.json().get("posts", [])
@@ -77,13 +78,15 @@ def get_posts_by_group(group_id):
 
         posts.extend(chunk)
         page += 1
+
     return posts
 
 def get_metrics(code):
     r = requests.get(
         f"{API_DOMAIN}/threads/post/metrics",
         headers=HEADERS,
-        params={"code": code}
+        params={"code": code},
+        timeout=REQ_TIMEOUT
     )
     r.raise_for_status()
     return r.json().get("data", [])
@@ -109,7 +112,7 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS
+# DB FUNCTIONS (social_posts 原本貼文表)
 # =======================================================
 def get_existing_post(permalink):
     try:
@@ -120,6 +123,9 @@ def get_existing_post(permalink):
         return None
 
 def upsert_post(post, metrics):
+    """
+    保留原本 social_posts 行為：permalink 唯一，一篇貼文只存一筆
+    """
     try:
         post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
         post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
@@ -174,7 +180,69 @@ def upsert_post(post, metrics):
         return "insert"
 
     except Exception as e:
-        print("DB Error:", e)
+        print("DB Error (social_posts):", e)
+        conn.rollback()
+        return "skip"
+
+# =======================================================
+# DB FUNCTIONS (social_posts_events 事件表) ✅ 新增
+# =======================================================
+def upsert_event(post, group_name, metrics):
+    """
+    social_posts_events：一筆 = 一次命中事件（permalink + group + keyword）
+    你要 2000+ 就靠這張表
+    """
+    try:
+        post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
+        post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+        now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
+
+        permalink = post["permalink"]
+        keyword_text = post.get("keywordText")
+        code = post.get("code")
+
+        cursor.execute("""
+            INSERT INTO social_posts_events (
+                post_time, permalink, code,
+                keyword_group, keyword,
+                poster_name, content, threads_topic,
+                threads_like_count, threads_comment_count,
+                threads_share_count, threads_repost_count,
+                site, channel, api_source,
+                created_at, updated_at
+            )
+            VALUES (
+                %s, %s, %s,
+                %s, %s,
+                %s, %s, %s,
+                %s, %s, %s, %s,
+                'THREADS', 'threads專案', 'threadslytics',
+                %s, %s
+            )
+            ON CONFLICT (permalink, keyword_group, keyword)
+            DO UPDATE SET
+                poster_name = EXCLUDED.poster_name,
+                content = EXCLUDED.content,
+                threads_topic = EXCLUDED.threads_topic,
+                threads_like_count = EXCLUDED.threads_like_count,
+                threads_comment_count = EXCLUDED.threads_comment_count,
+                threads_share_count = EXCLUDED.threads_share_count,
+                threads_repost_count = EXCLUDED.threads_repost_count,
+                updated_at = EXCLUDED.updated_at
+        """, (
+            post_tw, permalink, code,
+            group_name, keyword_text,
+            post.get("username"), post.get("caption"), post.get("tagHeader"),
+            metrics["likeCount"], metrics["directReplyCount"],
+            metrics["shares"], metrics["repostCount"],
+            now_tw, now_tw
+        ))
+
+        conn.commit()
+        return "event_upsert"
+
+    except Exception as e:
+        print("DB Error (social_posts_events):", e)
         conn.rollback()
         return "skip"
 
@@ -196,7 +264,11 @@ def manual_import_10():
                 break
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
+
+            # ✅ 原本表：貼文表（不破壞其他匯入）
             result = upsert_post(p, metrics)
+            # ✅ 新增表：事件表（你要 2000+ 靠這裡）
+            upsert_event(p, gname, metrics)
 
             if gname not in stats:
                 stats[gname] = {"insert": 0, "update": 0, "total": 0}
@@ -212,7 +284,6 @@ def manual_import_10():
 
     # ===== Email =====
     lines = ["【手動匯入前 10 筆】\n"]
-
     for g, s in stats.items():
         lines.append(f"🔍 關鍵字群組：{g}")
         lines.append(f"📌 時段內貼文數：{s['total']}")
@@ -231,7 +302,7 @@ def job_import_last_2_to_3_hours():
     start = now - timedelta(hours=3)
     end = now - timedelta(hours=2)
 
-    # ⭐ 台北時間
+    # ⭐ 台北時間（Email 顯示用）
     start_tw = (start + TAIPEI_OFFSET).replace(tzinfo=None)
     end_tw = (end + TAIPEI_OFFSET).replace(tzinfo=None)
 
@@ -253,7 +324,11 @@ def job_import_last_2_to_3_hours():
                 continue
 
             metrics = pick_best_metrics(get_metrics(p["code"]))
+
+            # ✅ 原本表
             result = upsert_post(p, metrics)
+            # ✅ 事件表（同時寫入）
+            upsert_event(p, gname, metrics)
 
             if result in ["insert", "update"]:
                 stat[result] += 1
