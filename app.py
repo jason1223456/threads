@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import time
+import random
 import requests
 import psycopg
 from psycopg.rows import dict_row
@@ -13,21 +14,30 @@ from email.mime.text import MIMEText
 from email.header import Header
 
 # =======================================================
-# API TOKEN（寫死版）
+# ✅ 你只要填這裡（把你原本的值貼進來）
 # =======================================================
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
-API_DOMAIN = "https://api.threadslytics.com/v1"
-HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
-REQ_TIMEOUT = 60
 
-# 時區設定
-TAIPEI_OFFSET = timedelta(hours=8)
-
-# =======================================================
-# PostgreSQL（寫死版 + lazy connect，避免 gunicorn import 直接爆）
-# =======================================================
 DATABASE_URL = ( "postgresql://root:" "L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz" "@sfo1.clusters.zeabur.com:30599/zeabur" )
 
+SMTP_USER = "jason91082500@gmail.com" 
+SMTP_PASS = "rwundvtaybzrgzlz" 
+SMTP_TO = "leona@brainmax-marketing.com"
+
+# =======================================================
+# 固定設定
+# =======================================================
+API_DOMAIN = "https://api.threadslytics.com/v1"
+HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
+TAIPEI_OFFSET = timedelta(hours=8)
+
+# requests timeout
+# connect timeout 固定 10s；read timeout 依此變數
+REQ_TIMEOUT = 60
+
+# =======================================================
+# Lazy DB connection（避免 gunicorn import 就連 DB 爆掉）
+# =======================================================
 _conn = None
 _cursor = None
 
@@ -35,18 +45,20 @@ def get_db():
     global _conn, _cursor
     if _conn is not None and _cursor is not None:
         return _conn, _cursor
+
     _conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
     _cursor = _conn.cursor()
     return _conn, _cursor
 
 # =======================================================
-# Gmail 設定（寫死版）
+# Gmail
 # =======================================================
-SMTP_USER = "jason91082500@gmail.com" 
-SMTP_PASS = "rwundvtaybzrgzlz" 
-SMTP_TO = "leona@brainmax-marketing.com"
-
 def send_email(subject, body):
+    # 若你暫時不想寄信：把 SMTP_* 留空即可，自動跳過
+    if not (SMTP_USER and SMTP_PASS and SMTP_TO):
+        print("ℹ️ SMTP not set, skip email")
+        return
+
     try:
         msg = MIMEText(body, "plain", "utf-8")
         msg["Subject"] = Header(subject, "utf-8")
@@ -62,26 +74,42 @@ def send_email(subject, body):
         print("❌ Email 寄送失敗：", e)
 
 # =======================================================
-# API FUNCTIONS（加 retry）
+# HTTP / API（強化：retry + backoff + jitter + 最後不 raise）
 # =======================================================
 session = requests.Session()
 
-def api_get_json(url, params=None, retries=3):
-    last = None
+def api_get_json(url, params=None, retries=5):
+    """
+    - timeout 分成 connect/read
+    - 重試 5 次 + 指數退避 + 抖動
+    - 最終失敗回傳 None（不要 raise，避免 APScheduler job 整個炸掉）
+    """
     for i in range(1, retries + 1):
         try:
-            r = session.get(url, headers=HEADERS, params=params, timeout=REQ_TIMEOUT)
+            r = session.get(
+                url,
+                headers=HEADERS,
+                params=params,
+                timeout=(10, REQ_TIMEOUT),  # (connect, read)
+            )
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            last = e
-            sleep_s = 1.5 ** (i - 1)
-            print(f"⚠️ API 失敗重試 {i}/{retries}: {e} (sleep {sleep_s:.1f}s)")
+            # 1,2,4,8,16 秒 + jitter（最多 60 秒）
+            base = min(60, 2 ** (i - 1))
+            jitter = random.uniform(0, 1.0)
+            sleep_s = base + jitter
+            print(f"⚠️ API error retry {i}/{retries}: {e} (sleep {sleep_s:.1f}s)")
             time.sleep(sleep_s)
-    raise last
+
+    print(f"❌ API failed after {retries} retries: {url}")
+    return None
 
 def get_keyword_groups():
-    return api_get_json(f"{API_DOMAIN}/keyword-groups")["data"]
+    data = api_get_json(f"{API_DOMAIN}/keyword-groups")
+    if not data or "data" not in data:
+        return []
+    return data["data"]
 
 def get_posts_by_group(group_id):
     posts = []
@@ -91,9 +119,13 @@ def get_posts_by_group(group_id):
             f"{API_DOMAIN}/keyword-groups/analytics/{group_id}",
             params={"metricDays": 7, "page": page},
         )
+        if not data:
+            break
+
         chunk = data.get("posts", [])
         if not chunk:
             break
+
         posts.extend(chunk)
         page += 1
     return posts
@@ -103,6 +135,8 @@ def get_metrics(code):
         f"{API_DOMAIN}/threads/post/metrics",
         params={"code": code},
     )
+    if not data:
+        return []
     return data.get("data", [])
 
 # =======================================================
@@ -126,15 +160,10 @@ def pick_best_metrics(metrics):
     return normalize_metrics(metrics[0])
 
 # =======================================================
-# DB FUNCTIONS (social_posts_events 事件表)  ✅只寫這張
-# 重要：你已經把欄位改名 post_time -> date，所以這裡用 date
-# 重要：你的表沒有 channel，所以這裡不寫 channel
+# DB: events only（重要：你已把 post_time 改成 date，所以用 date）
+#      且你的表沒有 channel，所以不寫 channel
 # =======================================================
 def upsert_event(post, group_name, metrics):
-    """
-    social_posts_events：一筆 = 一次命中事件（permalink + group + keyword）
-    需要 DB 有 unique constraint: (permalink, keyword_group, keyword)
-    """
     try:
         conn, cursor = get_db()
 
@@ -178,6 +207,7 @@ def upsert_event(post, group_name, metrics):
             metrics["shares"], metrics["repostCount"],
             now_tw, now_tw
         ))
+
         conn.commit()
         return "event_upsert"
 
@@ -191,23 +221,29 @@ def upsert_event(post, group_name, metrics):
         return "skip"
 
 # =======================================================
-# JOB: 手動匯入（前 10 筆） ✅只寫 events + 寄信
+# JOB: 手動匯入（前 10 筆）
 # =======================================================
 def manual_import_10_events_only():
     print("\n===== 🚀 手動匯入 10 筆（events only） =====")
     total = 0
-    groups = get_keyword_groups()
 
-    stats = {}  # group -> {upsert, total}
+    groups = get_keyword_groups()
+    if not groups:
+        print("⚠️ get_keyword_groups() empty. Skip manual import.")
+        return
+
+    stats = {}
     for group in groups:
         gname = group.get("groupName", "未知群組")
         posts = get_posts_by_group(group["id"])
+        if not posts:
+            continue
 
         for p in posts:
             if total >= 10:
                 break
 
-            metrics = pick_best_metrics(get_metrics(p["code"]))
+            metrics = pick_best_metrics(get_metrics(p.get("code")))
             result = upsert_event(p, gname, metrics)
 
             if gname not in stats:
@@ -231,7 +267,7 @@ def manual_import_10_events_only():
     send_email("Threads 手動匯入摘要（events only）", "\n".join(lines))
 
 # =======================================================
-# JOB: 每小時匯入（前 3～2 小時） ✅只寫 events + 寄信
+# JOB: 每小時匯入（前 3～2 小時）
 # =======================================================
 def job_import_last_2_to_3_hours_events_only():
     print("\n===== ⏰ 每小時 Threads 匯入（events only） =====")
@@ -248,19 +284,29 @@ def job_import_last_2_to_3_hours_events_only():
     ]
 
     groups = get_keyword_groups()
+    if not groups:
+        print("⚠️ get_keyword_groups() empty (API unstable). Skip this run.")
+        return
 
     for group in groups:
         gname = group.get("groupName", "未知群組")
         posts = get_posts_by_group(group["id"])
+        if not posts:
+            continue
 
         stat = {"upsert": 0, "total": 0}
 
         for p in posts:
-            t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
+            # postCreatedAt 是 UTC
+            try:
+                t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
+            except Exception:
+                continue
+
             if not (start <= t < end):
                 continue
 
-            metrics = pick_best_metrics(get_metrics(p["code"]))
+            metrics = pick_best_metrics(get_metrics(p.get("code")))
             result = upsert_event(p, gname, metrics)
 
             if result == "event_upsert":
@@ -270,6 +316,9 @@ def job_import_last_2_to_3_hours_events_only():
         if stat["total"] == 0:
             continue
 
+        # ✅ 你之前想要「跑完一個群組通知一下」：這行就有
+        print(f"✅ Group done: {gname} | events={stat['total']}")
+
         lines.append(f"🔍 關鍵字群組：{gname}")
         lines.append(f"📌 時段內事件數：{stat['total']}")
         lines.append(f"🆙 Upsert：{stat['upsert']}\n")
@@ -277,7 +326,7 @@ def job_import_last_2_to_3_hours_events_only():
     send_email("Threads 每小時匯入摘要（events only）", "\n".join(lines))
 
 # =======================================================
-# Flask + Scheduler（放在 create_app 裡）
+# Flask + Scheduler（放在 create_app 裡，避免 import 就啟動）
 # =======================================================
 def create_app():
     app = Flask(__name__)
@@ -289,6 +338,7 @@ def create_app():
 
     @app.route("/health")
     def health():
+        # DB 壞掉也不要讓服務起不來
         try:
             conn, cursor = get_db()
             cursor.execute("SELECT 1;")
@@ -302,6 +352,7 @@ def create_app():
 
     return app
 
+# gunicorn 入口
 app = create_app()
 
 if __name__ == "__main__":
