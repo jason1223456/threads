@@ -14,7 +14,7 @@ from email.mime.text import MIMEText
 from email.header import Header
 
 # =======================================================
-# ✅ 你只要填這裡（把你原本的值貼進來）
+# ✅ Hardcoded Config (NO ENV)
 # =======================================================
 API_TOKEN = "bscU4YK22+OYofSoh105OuVJZAh4tsYWZhKawi7WKjY="
 
@@ -23,38 +23,39 @@ DATABASE_URL = ( "postgresql://root:" "L2em9nY8K4PcxCuXV60tf1Hs5MG7j3Oz" "@sfo1.
 SMTP_USER = "jason91082500@gmail.com" 
 SMTP_PASS = "rwundvtaybzrgzlz" 
 SMTP_TO = "leona@brainmax-marketing.com"
-
 # =======================================================
-# 固定設定
+# Fixed settings
 # =======================================================
 API_DOMAIN = "https://api.threadslytics.com/v1"
 HEADERS = {"Authorization": f"Bearer {API_TOKEN}"}
 TAIPEI_OFFSET = timedelta(hours=8)
 
 # requests timeout
-# connect timeout 固定 10s；read timeout 依此變數
-REQ_TIMEOUT = 60
+REQ_TIMEOUT = 60  # seconds (read timeout); connect timeout fixed at 10s
+
+# 抓取貼文範圍：最近 24 小時內發文
+POST_LOOKBACK_HOURS = 24
+
+# 若啟動時不想自動跑「手動匯入10筆」，改成 False
+RUN_MANUAL_IMPORT_ON_START = True
 
 # =======================================================
-# Lazy DB connection（避免 gunicorn import 就連 DB 爆掉）
+# ✅ DB helper (better than global cursor sharing)
+#   - 不共用 cursor，避免 Flask/Scheduler 在多執行緒或重連時出問題
 # =======================================================
 _conn = None
-_cursor = None
 
-def get_db():
-    global _conn, _cursor
-    if _conn is not None and _cursor is not None:
-        return _conn, _cursor
-
-    _conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
-    _cursor = _conn.cursor()
-    return _conn, _cursor
+def get_conn():
+    global _conn
+    if _conn is None or _conn.closed:
+        _conn = psycopg.connect(DATABASE_URL, row_factory=dict_row)
+    return _conn
 
 # =======================================================
-# Gmail
+# Email (optional)
 # =======================================================
 def send_email(subject, body):
-    # 若你暫時不想寄信：把 SMTP_* 留空即可，自動跳過
+    # 若不想寄信：把 SMTP_* 留空即可，自動跳過
     if not (SMTP_USER and SMTP_PASS and SMTP_TO):
         print("ℹ️ SMTP not set, skip email")
         return
@@ -74,16 +75,11 @@ def send_email(subject, body):
         print("❌ Email 寄送失敗：", e)
 
 # =======================================================
-# HTTP / API（強化：retry + backoff + jitter + 最後不 raise）
+# HTTP / API (retry + backoff + jitter)
 # =======================================================
 session = requests.Session()
 
 def api_get_json(url, params=None, retries=5):
-    """
-    - timeout 分成 connect/read
-    - 重試 5 次 + 指數退避 + 抖動
-    - 最終失敗回傳 None（不要 raise，避免 APScheduler job 整個炸掉）
-    """
     for i in range(1, retries + 1):
         try:
             r = session.get(
@@ -95,7 +91,6 @@ def api_get_json(url, params=None, retries=5):
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            # 1,2,4,8,16 秒 + jitter（最多 60 秒）
             base = min(60, 2 ** (i - 1))
             jitter = random.uniform(0, 1.0)
             sleep_s = base + jitter
@@ -140,88 +135,139 @@ def get_metrics(code):
     return data.get("data", [])
 
 # =======================================================
-# METRICS
+# Metrics helpers
 # =======================================================
 def normalize_metrics(m):
     return {
+        "createdAt": m.get("createdAt"),
         "likeCount": m.get("likeCount") or 0,
         "directReplyCount": m.get("directReplyCount") or 0,
         "shares": m.get("shares") or 0,
-        "repostCount": m.get("repostCount") or 0
+        "repostCount": m.get("repostCount") or 0,
+        "quotes": m.get("quotes") or 0,
     }
 
-def pick_best_metrics(metrics):
+def pick_latest_metrics(metrics):
+    """
+    Return (metric_time_utc: datetime|None, metrics_dict)
+    Choose the newest metrics by createdAt.
+    """
     if not metrics:
-        return {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0}
+        return None, {"likeCount": 0, "directReplyCount": 0, "shares": 0, "repostCount": 0, "quotes": 0}
+
+    parsed = []
     for m in metrics:
         nm = normalize_metrics(m)
-        if any(nm.values()):
-            return nm
-    return normalize_metrics(metrics[0])
-
-# =======================================================
-# DB: events only（重要：你已把 post_time 改成 date，所以用 date）
-#      且你的表沒有 channel，所以不寫 channel
-# =======================================================
-def upsert_event(post, group_name, metrics):
-    try:
-        conn, cursor = get_db()
-
-        post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
-        post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
-        now_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
-
-        cursor.execute("""
-            INSERT INTO social_posts_events (
-                date, permalink, code,
-                keyword_group, keyword,
-                poster_name, content, threads_topic,
-                threads_like_count, threads_comment_count,
-                threads_share_count, threads_repost_count,
-                site, api_source,
-                created_at, updated_at
-            )
-            VALUES (
-                %s, %s, %s,
-                %s, %s,
-                %s, %s, %s,
-                %s, %s, %s, %s,
-                'THREADS', 'threadslytics',
-                %s, %s
-            )
-            ON CONFLICT (permalink, keyword_group, keyword)
-            DO UPDATE SET
-                poster_name = EXCLUDED.poster_name,
-                content = EXCLUDED.content,
-                threads_topic = EXCLUDED.threads_topic,
-                threads_like_count = EXCLUDED.threads_like_count,
-                threads_comment_count = EXCLUDED.threads_comment_count,
-                threads_share_count = EXCLUDED.threads_share_count,
-                threads_repost_count = EXCLUDED.threads_repost_count,
-                updated_at = EXCLUDED.updated_at
-        """, (
-            post_tw, post.get("permalink"), post.get("code"),
-            group_name, post.get("keywordText"),
-            post.get("username"), post.get("caption"), post.get("tagHeader"),
-            metrics["likeCount"], metrics["directReplyCount"],
-            metrics["shares"], metrics["repostCount"],
-            now_tw, now_tw
-        ))
-
-        conn.commit()
-        return "event_upsert"
-
-    except Exception as e:
-        print("DB Error (social_posts_events):", e)
+        ca = nm.get("createdAt")
+        if not ca:
+            continue
         try:
-            conn, _ = get_db()
-            conn.rollback()
-        except:
-            pass
-        return "skip"
+            t = datetime.fromisoformat(ca.replace("Z", "+00:00"))
+        except Exception:
+            continue
+        parsed.append((t, nm))
+
+    if not parsed:
+        # fallback: take first
+        first = normalize_metrics(metrics[0])
+        return None, first
+
+    parsed.sort(key=lambda x: x[0], reverse=True)
+    return parsed[0][0], parsed[0][1]
 
 # =======================================================
-# JOB: 手動匯入（前 10 筆）
+# DB logic
+#  - 用 created_at 當 metrics 快照時間（台北時間）
+#  - 用 updated_at 當寫入時間（台北時間）
+#  - 你已經建了 UNIQUE (code, created_at)，所以用 ON CONFLICT DO NOTHING 防重
+# =======================================================
+def get_latest_snapshot_time_for_code(code: str):
+    conn = get_conn()
+    with conn.cursor() as cursor:
+        cursor.execute("""
+            SELECT created_at
+            FROM social_posts_events
+            WHERE code = %s
+            ORDER BY created_at DESC
+            LIMIT 1
+        """, (code,))
+        row = cursor.fetchone()
+        return row["created_at"] if row else None
+
+def insert_new_metrics_row(post, group_name, snap_time_utc, metrics):
+    """
+    Insert a NEW row only when snap_time is newer than latest snapshot in DB.
+    Stored:
+      - date       : post publish time (Taipei)
+      - created_at : metric snapshot time (Taipei)
+      - updated_at : ingestion time (Taipei)
+    """
+    conn = get_conn()
+
+    # post publish time (UTC -> Taipei naive)
+    try:
+        post_utc = datetime.fromisoformat(post["postCreatedAt"].replace("Z", "+00:00"))
+    except Exception:
+        return "skip_bad_post_time"
+
+    post_tw = (post_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+
+    # snapshot time for metrics (UTC -> Taipei naive)
+    now_utc = datetime.now(timezone.utc)
+    snap_utc = snap_time_utc or now_utc
+    snap_tw = (snap_utc + TAIPEI_OFFSET).replace(tzinfo=None)
+
+    code = post.get("code")
+    if not code:
+        return "skip_no_code"
+
+    latest = get_latest_snapshot_time_for_code(code)
+    if latest and snap_tw <= latest:
+        return "skip_old"
+
+    ingest_tw = (datetime.utcnow() + TAIPEI_OFFSET).replace(tzinfo=None)
+
+    try:
+        with conn.cursor() as cursor:
+            cursor.execute("""
+                INSERT INTO social_posts_events (
+                    date, permalink, code,
+                    keyword_group, keyword,
+                    poster_name, content, threads_topic,
+                    threads_like_count, threads_comment_count,
+                    threads_share_count, threads_repost_count,
+                    site, api_source,
+                    created_at, updated_at
+                )
+                VALUES (
+                    %s, %s, %s,
+                    %s, %s,
+                    %s, %s, %s,
+                    %s, %s, %s, %s,
+                    'THREADS', 'threadslytics',
+                    %s, %s
+                )
+                ON CONFLICT (code, created_at) DO NOTHING
+            """, (
+                post_tw, post.get("permalink"), code,
+                group_name, post.get("keywordText"),
+                post.get("username"), post.get("caption"), post.get("tagHeader"),
+                metrics["likeCount"], metrics["directReplyCount"],
+                metrics["shares"], metrics["repostCount"],
+                snap_tw, ingest_tw
+            ))
+        conn.commit()
+        return "inserted"
+    except Exception as e:
+        print("DB Error (insert social_posts_events):", e)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return "error"
+
+# =======================================================
+# JOB: manual import first 10
 # =======================================================
 def manual_import_10_events_only():
     print("\n===== 🚀 手動匯入 10 筆（events only） =====")
@@ -243,15 +289,17 @@ def manual_import_10_events_only():
             if total >= 10:
                 break
 
-            metrics = pick_best_metrics(get_metrics(p.get("code")))
-            result = upsert_event(p, gname, metrics)
+            snap_time_utc, m = pick_latest_metrics(get_metrics(p.get("code")))
+            result = insert_new_metrics_row(p, gname, snap_time_utc, m)
 
-            if gname not in stats:
-                stats[gname] = {"upsert": 0, "total": 0}
-
-            if result == "event_upsert":
-                stats[gname]["upsert"] += 1
-                stats[gname]["total"] += 1
+            stats.setdefault(gname, {"inserted": 0, "skipped": 0, "error": 0, "total": 0})
+            stats[gname]["total"] += 1
+            if result == "inserted":
+                stats[gname]["inserted"] += 1
+            elif result in ("skip_old", "skip_bad_post_time", "skip_no_code"):
+                stats[gname]["skipped"] += 1
+            else:
+                stats[gname]["error"] += 1
 
             total += 1
 
@@ -261,27 +309,26 @@ def manual_import_10_events_only():
     lines = ["【Threads 手動匯入前 10 筆（events only）】\n"]
     for g, s in stats.items():
         lines.append(f"🔍 關鍵字群組：{g}")
-        lines.append(f"📌 寫入事件數：{s['total']}")
-        lines.append(f"🆙 Upsert：{s['upsert']}\n")
+        lines.append(f"📌 本次處理：{s['total']}")
+        lines.append(f"✅ 新增：{s['inserted']}")
+        lines.append(f"⏭️ 跳過：{s['skipped']}")
+        lines.append(f"❌ 錯誤：{s['error']}\n")
 
     send_email("Threads 手動匯入摘要（events only）", "\n".join(lines))
 
 # =======================================================
-# JOB: 每小時匯入（前 3～2 小時）
+# JOB: hourly import (rolling last 24h posts)
 # =======================================================
-def job_import_last_2_to_3_hours_events_only():
-    print("\n===== ⏰ 每小時 Threads 匯入（events only） =====")
+def job_import_last_24_hours_events_only():
+    print("\n===== ⏰ 每小時 Threads 匯入（最近 24 小時貼文） =====")
 
     now = datetime.now(timezone.utc)
-    start = now - timedelta(hours=3)
-    end = now - timedelta(hours=2)
+    start = now - timedelta(hours=POST_LOOKBACK_HOURS)
 
     start_tw = (start + TAIPEI_OFFSET).replace(tzinfo=None)
-    end_tw = (end + TAIPEI_OFFSET).replace(tzinfo=None)
+    now_tw = (now + TAIPEI_OFFSET).replace(tzinfo=None)
 
-    lines = [
-        f"時間區間：{start_tw.strftime('%Y-%m-%d %H:%M:%S')} ～ {end_tw.strftime('%Y-%m-%d %H:%M:%S')}\n"
-    ]
+    lines = [f"發文時間範圍：{start_tw:%Y-%m-%d %H:%M:%S} ～ {now_tw:%Y-%m-%d %H:%M:%S}\n"]
 
     groups = get_keyword_groups()
     if not groups:
@@ -294,54 +341,65 @@ def job_import_last_2_to_3_hours_events_only():
         if not posts:
             continue
 
-        stat = {"upsert": 0, "total": 0}
+        stat = {"inserted": 0, "skipped": 0, "error": 0, "total": 0}
 
         for p in posts:
             # postCreatedAt 是 UTC
             try:
-                t = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
+                post_time_utc = datetime.fromisoformat(p["postCreatedAt"].replace("Z", "+00:00"))
             except Exception:
                 continue
 
-            if not (start <= t < end):
+            # ✅ 只抓最近 24 小時內發的貼文
+            if post_time_utc < start:
                 continue
 
-            metrics = pick_best_metrics(get_metrics(p.get("code")))
-            result = upsert_event(p, gname, metrics)
+            snap_time_utc, m = pick_latest_metrics(get_metrics(p.get("code")))
+            result = insert_new_metrics_row(p, gname, snap_time_utc, m)
 
-            if result == "event_upsert":
-                stat["upsert"] += 1
-                stat["total"] += 1
+            stat["total"] += 1
+            if result == "inserted":
+                stat["inserted"] += 1
+            elif result in ("skip_old", "skip_bad_post_time", "skip_no_code"):
+                stat["skipped"] += 1
+            else:
+                stat["error"] += 1
 
         if stat["total"] == 0:
             continue
 
-        # ✅ 你之前想要「跑完一個群組通知一下」：這行就有
-        print(f"✅ Group done: {gname} | events={stat['total']}")
-
+        print(f"✅ Group done: {gname} | total={stat['total']} inserted={stat['inserted']} skipped={stat['skipped']} error={stat['error']}")
         lines.append(f"🔍 關鍵字群組：{gname}")
-        lines.append(f"📌 時段內事件數：{stat['total']}")
-        lines.append(f"🆙 Upsert：{stat['upsert']}\n")
+        lines.append(f"📌 本次處理：{stat['total']}")
+        lines.append(f"✅ 新增：{stat['inserted']}")
+        lines.append(f"⏭️ 跳過：{stat['skipped']}")
+        lines.append(f"❌ 錯誤：{stat['error']}\n")
 
-    send_email("Threads 每小時匯入摘要（events only）", "\n".join(lines))
+    send_email("Threads 每小時匯入摘要（最近24h貼文）", "\n".join(lines))
 
 # =======================================================
-# Flask + Scheduler（放在 create_app 裡，避免 import 就啟動）
+# Flask + Scheduler
 # =======================================================
 def create_app():
     app = Flask(__name__)
 
     scheduler = BackgroundScheduler()
-    scheduler.add_job(job_import_last_2_to_3_hours_events_only, "cron", minute=0)
-    scheduler.add_job(manual_import_10_events_only, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
+
+    # ✅ 每小時整點跑一次：rolling 24h 回寫
+    scheduler.add_job(job_import_last_24_hours_events_only, "cron", minute=0)
+
+    # 可選：啟動後跑一次手動匯入 10 筆
+    if RUN_MANUAL_IMPORT_ON_START:
+        scheduler.add_job(manual_import_10_events_only, "date", run_date=datetime.utcnow() + timedelta(seconds=5))
+
     scheduler.start()
 
     @app.route("/health")
     def health():
-        # DB 壞掉也不要讓服務起不來
         try:
-            conn, cursor = get_db()
-            cursor.execute("SELECT 1;")
+            conn = get_conn()
+            with conn.cursor() as cursor:
+                cursor.execute("SELECT 1;")
             return "OK", 200
         except Exception as e:
             return f"DB_NOT_READY: {e}", 200
@@ -352,8 +410,8 @@ def create_app():
 
     return app
 
-# gunicorn 入口
 app = create_app()
 
 if __name__ == "__main__":
+    # For local run
     app.run(host="0.0.0.0", port=5000)
